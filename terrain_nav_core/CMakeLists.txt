@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.18)
 project(terrain_nav_core LANGUAGES CXX)
 
+set(PYBIND11_FINDPYTHON ON)
+find_package(Python COMPONENTS Interpreter Development REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
 
 pybind11_add_module(

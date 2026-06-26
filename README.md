@@ -501,7 +501,7 @@ http://127.0.0.1:8050
 
 ```bash
 python3 -m pip install pybind11
-cmake -S terrain_nav_core -B terrain_nav_core/build
+cmake -S terrain_nav_core -B terrain_nav_core/build -DPython_EXECUTABLE=$(which python3)
 cmake --build terrain_nav_core/build --config Release
 ```
 
