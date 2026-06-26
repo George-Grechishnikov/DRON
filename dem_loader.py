@@ -72,6 +72,9 @@ class DEMLoader:
             dtype=str(self._raster.dtypes[0]),
             transform=self._raster.transform,
         )
+        self._data = self._raster.read(1, out_dtype="float64").copy()
+        if self.metadata.nodata is not None:
+            self._data[np.isclose(self._data, self.metadata.nodata)] = np.nan
         self._patch_cache: OrderedDict[tuple[float, float, float], tuple[np.ndarray, Affine]] = OrderedDict()
         local_path = Path(self.path)
         file_size = local_path.stat().st_size if local_path.exists() else 0
@@ -127,8 +130,11 @@ class DEMLoader:
         max_lon = max(west_lon, east_lon)
         min_lat = min(south_lat, north_lat)
         max_lat = max(south_lat, north_lat)
-        self._validate_bounds(min_lat, min_lon)
-        self._validate_bounds(max_lat, max_lon)
+        left, bottom, right, top = self.metadata.bounds
+        min_lon = min(max(min_lon, left), right)
+        max_lon = min(max(max_lon, left), right)
+        min_lat = min(max(min_lat, bottom), top)
+        max_lat = min(max(max_lat, bottom), top)
 
         window = windows.from_bounds(
             left=min_lon,
@@ -138,9 +144,11 @@ class DEMLoader:
             transform=self._raster.transform,
         )
         window = window.round_offsets().round_lengths()
-        patch = self._raster.read(1, window=window, out_dtype="float64").copy()
-        if self.metadata.nodata is not None:
-            patch[np.isclose(patch, self.metadata.nodata)] = np.nan
+        row_off = max(int(window.row_off), 0)
+        col_off = max(int(window.col_off), 0)
+        row_end = min(int(window.row_off + window.height), self._data.shape[0])
+        col_end = min(int(window.col_off + window.width), self._data.shape[1])
+        patch = self._data[row_off:row_end, col_off:col_end].copy()
         transform = self._raster.window_transform(window)
 
         self._patch_cache[key] = (patch, transform)
@@ -195,10 +203,8 @@ class DEMLoader:
         return float(row), float(col)
 
     def _read_window_array(self, row: float, col: float) -> np.ndarray:
-        data = self._raster.read(1, out_dtype="float64").copy()
-        if self.metadata.nodata is not None:
-            data[np.isclose(data, self.metadata.nodata)] = np.nan
-        return data
+        del row, col
+        return self._data
 
     def _validate_bounds(self, lat: float, lon: float) -> None:
         left, bottom, right, top = self.metadata.bounds

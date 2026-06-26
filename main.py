@@ -415,21 +415,29 @@ def pipeline_worker(
 ) -> list[tuple[int, IMMResult]]:
     """Run the main sliding-window pipeline."""
 
+    geod = pyproj.Geod(ellps="WGS84")
     history: list[tuple[int, IMMResult]] = []
     buffer: deque[FramePacket] = deque(maxlen=config.window_size)
-    current_lat = config.start_lat
-    current_lon = config.start_lon
+    window_start_lat = config.start_lat
+    window_start_lon = config.start_lon
     current_azimuth = 45.0
     current_speed = config.speed_mps
     step_dt = config.step_size / config.freq_hz
     window_duration = config.window_size / config.freq_hz
     window_counter = 0
+    measurement_step_m = config.speed_mps / config.freq_hz
+    measured_profile_length_m = config.window_size * measurement_step_m
+    reference_profile_length_m = measured_profile_length_m + config.max_offset_m
 
     with DEMLoader(config.dem_path) as dem:
-        extractor = ProfileExtractor(dem, profile_length_m=config.window_size * config.speed_mps / config.freq_hz)
+        extractor = ProfileExtractor(
+            dem,
+            profile_length_m=reference_profile_length_m,
+            step_m=measurement_step_m,
+        )
         correlator = Correlator(
-            profile_length_m=config.window_size * config.speed_mps / config.freq_hz,
-            step_m=30.0,
+            profile_length_m=measured_profile_length_m,
+            step_m=measurement_step_m,
             max_offset_m=config.max_offset_m,
         )
         solver = PositionSolver()
@@ -449,40 +457,39 @@ def pipeline_worker(
 
             frames_window = [item.frame for item in buffer]
             center_frame_index = buffer[-1].index
-            h_meas = np.array([frame.radar_alt_m for frame in frames_window], dtype=float)
+            h_meas = np.array(
+                [config.altitude_msl_m - frame.radar_alt_m for frame in frames_window],
+                dtype=float,
+            )
             flat = is_flat_terrain(h_meas, threshold_m=config.flat_terrain_threshold_m)
-            ref_matrix = extractor.build_reference_matrix(current_lat, current_lon)
-            corr_result = correlator.sliding_window_compute(
-                frames_buffer=frames_window,
+            ref_matrix = extractor.build_reference_matrix(window_start_lat, window_start_lon)
+            corr_result = correlator.compute(
+                h_meas=h_meas,
                 ref_matrix=ref_matrix,
-                speed_mps=config.speed_mps,
-                freq_hz=config.freq_hz,
                 azimuths_deg=np.arange(0.0, ref_matrix.shape[0], 1.0),
             )
 
             if window_counter < config.cold_start_windows:
                 position_fix = predict_fix(
-                    current_lat=current_lat,
-                    current_lon=current_lon,
+                    current_lat=window_start_lat,
+                    current_lon=window_start_lon,
                     speed_mps=current_speed,
                     azimuth_deg=current_azimuth,
-                    dt=step_dt,
+                    dt=window_duration,
                     confidence=corr_result.confidence,
                 )
             else:
                 position_fix = solver.solve(
                     result=corr_result,
-                    start_lat=current_lat,
-                    start_lon=current_lon,
+                    start_lat=window_start_lat,
+                    start_lon=window_start_lon,
                     window_duration_s=window_duration,
                 )
 
             imm_result = imm.update(position_fix, dt=step_dt, is_flat=flat)
-            current_lat = imm_result.lat
-            current_lon = imm_result.lon
             current_azimuth = imm_result.azimuth_deg
             current_speed = imm_result.speed_mps
-            dem_patch, _ = dem.get_patch(current_lat, current_lon, radius_m=config.dem_patch_radius_m)
+            dem_patch, _ = dem.get_patch(imm_result.lat, imm_result.lon, radius_m=config.dem_patch_radius_m)
 
             history.append((center_frame_index, imm_result))
             _enqueue_state(
@@ -501,6 +508,14 @@ def pipeline_worker(
             for _ in range(min(config.step_size, len(buffer))):
                 if buffer:
                     buffer.popleft()
+            next_start_lon, next_start_lat, _ = geod.fwd(
+                window_start_lon,
+                window_start_lat,
+                current_azimuth,
+                current_speed * step_dt,
+            )
+            window_start_lat = float(next_start_lat)
+            window_start_lon = float(next_start_lon)
             window_counter += 1
 
     return history

@@ -66,6 +66,7 @@ DRON/
   test_position_solver.py
   test_imm_filter.py
   test_visualizer.py
+  integration_test.py
   test_main.py
 ```
 
@@ -320,6 +321,18 @@ python .\main.py --sim --dem .\data\dem.tif --trajectory 1 --no-visualizer
 python -m pytest .\test_sim_generator.py .\test_nmea_parser.py .\test_dem_loader.py .\test_profile_extractor.py .\test_correlator.py .\test_position_solver.py .\test_imm_filter.py .\test_visualizer.py .\test_main.py -q
 ```
 
+Финальный интеграционный прогон:
+
+```powershell
+python -m pytest .\integration_test.py -q
+```
+
+Этот тест сейчас подтверждает, что полный pipeline:
+- запускается end-to-end
+- не падает на многопоточном сценарии
+- выдаёт историю результатов и метрики
+- сохраняет HTML-отчёт
+
 ### Минимальный сценарий работы
 
 1. Подготовить `DEM` в формате `GeoTIFF`
@@ -349,4 +362,7 @@ python -m pytest .\test_sim_generator.py .\test_nmea_parser.py .\test_dem_loader
 
 ## Что осталось дальше
 
-Следующий шаг после этого — уже отдельная полноценная интеграционная проверка `integration_test.py`, чтобы прогнать весь pipeline как единое целое по сценариям из задания.
+Следующий шаг после этого — уже не сборка модулей, а улучшение точности навигационного решения:
+- калибровка корреляции и стратегии смещения окна
+- усиление логики начальной привязки
+- доведение replay-метрик до целевых порогов из задания
