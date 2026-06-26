@@ -10,6 +10,7 @@
 - `correlator.py` — корреляционный движок для поиска лучшего азимута и смещения
 - `position_solver.py` — преобразование корреляционного результата в геодезический fix
 - `imm_filter.py` — сглаживание решения через режимы hover/cruise/turn
+- `visualizer.py` — Plotly Dash дашборд реального времени
 
 Этот `README` будем постепенно дополнять по мере реализации следующих задач.
 
@@ -34,11 +35,13 @@
 - `pyproj`
 - `scipy`
 - `pytest`
+- `dash`
+- `plotly`
 
 Установка зависимостей:
 
 ```powershell
-python -m pip install --user numpy rasterio pyproj scipy pytest
+python -m pip install --user numpy rasterio pyproj scipy pytest dash plotly
 ```
 
 ## Структура проекта
@@ -52,6 +55,7 @@ DRON/
   correlator.py
   position_solver.py
   imm_filter.py
+  visualizer.py
   test_sim_generator.py
   test_nmea_parser.py
   test_dem_loader.py
@@ -59,6 +63,7 @@ DRON/
   test_correlator.py
   test_position_solver.py
   test_imm_filter.py
+  test_visualizer.py
 ```
 
 ## Что уже умеет проект
@@ -251,6 +256,27 @@ print(imm_result.model_weights)
 print(imm_result.dominant_mode)
 ```
 
+### 8. Визуализация
+
+`visualizer.py` умеет:
+- поднимать `Plotly Dash` дашборд
+- неблокирующе читать состояние из `queue.Queue`
+- показывать 4 панели: heatmap, карту, профили и IMM telemetry
+- хранить историю траектории между тиками
+- экспортировать HTML-отчёт полёта
+
+Пример использования:
+
+```python
+import queue
+
+from visualizer import TerrainNavigatorDash
+
+state_queue = queue.Queue(maxsize=100)
+dashboard = TerrainNavigatorDash(state_queue=state_queue)
+dashboard.run(host="127.0.0.1", port=8050, debug=False)
+```
+
 ## Как запускать то, что уже есть
 
 ### Проверка модулей тестами
@@ -258,7 +284,7 @@ print(imm_result.dominant_mode)
 Запуск всех текущих тестов:
 
 ```powershell
-python -m pytest .\test_sim_generator.py .\test_nmea_parser.py .\test_dem_loader.py .\test_profile_extractor.py .\test_correlator.py .\test_position_solver.py .\test_imm_filter.py -q
+python -m pytest .\test_sim_generator.py .\test_nmea_parser.py .\test_dem_loader.py .\test_profile_extractor.py .\test_correlator.py .\test_position_solver.py .\test_imm_filter.py .\test_visualizer.py -q
 ```
 
 ### Минимальный сценарий работы
@@ -271,12 +297,11 @@ python -m pytest .\test_sim_generator.py .\test_nmea_parser.py .\test_dem_loader
 6. Найти лучший азимут и смещение через `correlator.py`
 7. Перевести корреляционный результат в координаты через `position_solver.py`
 8. Сгладить навигационное решение через `imm_filter.py`
+9. Показать потоковое состояние в `visualizer.py`
 
 ## Что будет добавлено дальше
 
 Следующие модули, которые будут появляться в проекте:
-- `position_solver.py`
-- `visualizer.py`
 - `main.py`
 
 Когда они будут готовы, я буду дополнять этот `README`:

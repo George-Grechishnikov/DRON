@@ -1,0 +1,75 @@
+from __future__ import annotations
+
+import queue
+from pathlib import Path
+
+import numpy as np
+
+from correlator import CorrelationResult
+from imm_filter import IMMResult
+from visualizer import TerrainNavigatorDash, create_arrow_shape, export_flight_report
+
+
+def _fake_corr() -> CorrelationResult:
+    return CorrelationResult(
+        best_azimuth_deg=45.0,
+        best_offset_steps=3,
+        best_offset_m=90.0,
+        peak_correlation=0.87,
+        confidence=0.42,
+        is_reliable=True,
+        heatmap=np.array([[0.1, 0.2], [0.4, 0.9]], dtype=float),
+        azimuths_deg=np.array([0.0, 45.0], dtype=float),
+        best_reference_profile=np.array([100.0, 105.0, 103.0], dtype=float),
+    )
+
+
+def _fake_fix() -> IMMResult:
+    return IMMResult(
+        lat=60.5001,
+        lon=90.3002,
+        speed_mps=52.0,
+        azimuth_deg=44.0,
+        model_weights=np.array([0.1, 0.75, 0.15], dtype=float),
+        covariance=np.diag([36.0, 49.0, 4.0, 4.0]).astype(float),
+        dominant_mode="cruise",
+    )
+
+
+def test_update_all_panels_returns_four_figures_and_store() -> None:
+    state_queue: queue.Queue = queue.Queue()
+    dash_app = TerrainNavigatorDash(state_queue=state_queue)
+    state_queue.put(
+        {
+            "corr": _fake_corr(),
+            "fix": _fake_fix(),
+            "h_meas": np.array([101.0, 107.0, 102.0], dtype=float),
+            "ref": np.array([100.0, 105.0, 103.0], dtype=float),
+            "dem_patch": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=float),
+            "hdop": 12.0,
+        }
+    )
+
+    heatmap_fig, terrain_fig, profiles_fig, telemetry_fig, store = dash_app.update_all_panels(
+        1,
+        {"history": []},
+    )
+
+    assert len(heatmap_fig.data) >= 2
+    assert len(terrain_fig.data) >= 3
+    assert len(profiles_fig.data) >= 2
+    assert len(telemetry_fig.data) >= 2
+    assert len(store["history"]) == 1
+
+
+def test_create_arrow_shape_returns_three_segments() -> None:
+    shapes = create_arrow_shape(60.5, 90.3, 45.0)
+    assert len(shapes) == 3
+    assert all(shape["type"] == "line" for shape in shapes)
+
+
+def test_export_flight_report_writes_html(tmp_path: Path) -> None:
+    output_path = tmp_path / "report.html"
+    export_flight_report([_fake_fix(), _fake_fix()], str(output_path))
+    assert output_path.exists()
+    assert "plotly" in output_path.read_text(encoding="utf-8").lower()
