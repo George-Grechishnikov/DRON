@@ -6,6 +6,7 @@
 - `sim_generator.py` — генератор синтетических NMEA-данных радиовысотомера
 - `nmea_parser.py` — парсер потока NMEA-0183
 - `dem_loader.py` — загрузчик DEM/ЦМР с выборкой высот и профилей
+- `profile_extractor.py` — построитель эталонных профилей рельефа
 
 Этот `README` будем постепенно дополнять по мере реализации следующих задач.
 
@@ -44,9 +45,11 @@ DRON/
   sim_generator.py
   nmea_parser.py
   dem_loader.py
+  profile_extractor.py
   test_sim_generator.py
   test_nmea_parser.py
   test_dem_loader.py
+  test_profile_extractor.py
 ```
 
 ## Что уже умеет проект
@@ -129,6 +132,34 @@ with DEMLoader("data/dem.tif") as dem:
     )
 ```
 
+### 4. Построение эталонных профилей
+
+`profile_extractor.py` умеет:
+- строить матрицу эталонных профилей для набора азимутов
+- собирать профили параллельно
+- переиспользовать кэш, если центр окна сместился меньше чем на `200 м`
+- нормализовать профили перед корреляцией
+- определять плоский рельеф, где корреляция ненадёжна
+
+Пример использования:
+
+```python
+import numpy as np
+
+from dem_loader import DEMLoader
+from profile_extractor import ProfileExtractor, is_flat_terrain, normalize_profile
+
+with DEMLoader("data/dem.tif") as dem:
+    extractor = ProfileExtractor(dem, profile_length_m=5000.0, step_m=30.0)
+    ref_matrix = extractor.build_reference_matrix(
+        center_lat=60.5,
+        center_lon=90.3,
+        azimuths=np.arange(0, 360, 1.0),
+    )
+    normalized = normalize_profile(ref_matrix[45])
+    flat = is_flat_terrain(ref_matrix[45])
+```
+
 ## Как запускать то, что уже есть
 
 ### Проверка модулей тестами
@@ -136,7 +167,7 @@ with DEMLoader("data/dem.tif") as dem:
 Запуск всех текущих тестов:
 
 ```powershell
-python -m pytest .\test_sim_generator.py .\test_nmea_parser.py .\test_dem_loader.py -q
+python -m pytest .\test_sim_generator.py .\test_nmea_parser.py .\test_dem_loader.py .\test_profile_extractor.py -q
 ```
 
 ### Минимальный сценарий работы
@@ -145,11 +176,11 @@ python -m pytest .\test_sim_generator.py .\test_nmea_parser.py .\test_dem_loader
 2. Сгенерировать `.nmea` и `ground truth` через `sim_generator.py`
 3. Прочитать `.nmea` через `nmea_parser.py`
 4. Использовать `dem_loader.py` для получения профилей рельефа
+5. Построить эталонную матрицу через `profile_extractor.py`
 
 ## Что будет добавлено дальше
 
 Следующие модули, которые будут появляться в проекте:
-- `profile_extractor.py`
 - `correlator.py`
 - `position_solver.py`
 - `imm_filter.py`
