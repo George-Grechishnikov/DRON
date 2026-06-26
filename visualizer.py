@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import math
 import queue
-from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, List
 
 import dash
 from dash import Dash, Input, Output, State, dcc, html, no_update
 import numpy as np
 import plotly.graph_objects as go
 from plotly.offline import plot as offline_plot
+from plotly.subplots import make_subplots
 
 from correlator import CorrelationResult, build_heatmap
 from imm_filter import IMMResult
@@ -85,6 +85,162 @@ def export_flight_report(history: List[IMMResult], path: str) -> None:
     offline_plot(figure, filename=str(output_path), auto_open=False, include_plotlyjs="cdn")
 
 
+def export_demo_report(records: list[dict[str, Any]], path: str) -> None:
+    """Export a jury-facing HTML report with truth, estimate, GNSS, and correlation."""
+
+    if not records:
+        return
+
+    timestamps = [float(record["timestamp"]) for record in records]
+    estimated_lons = [float(record["estimated_lon"]) for record in records]
+    estimated_lats = [float(record["estimated_lat"]) for record in records]
+    truth_lons = [record["truth_lon"] for record in records]
+    truth_lats = [record["truth_lat"] for record in records]
+    correlation_peaks = [float(record["correlation_peak"]) for record in records]
+    truth_errors = [float(record["truth_error_m"]) for record in records]
+    gnss_available = [bool(record["gnss_available"]) for record in records]
+
+    gnss_loss_index = next((idx for idx, available in enumerate(gnss_available) if not available), None)
+    gnss_loss_time = timestamps[gnss_loss_index] if gnss_loss_index is not None else None
+
+    figure = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=False,
+        vertical_spacing=0.12,
+        subplot_titles=(
+            "Truth vs Estimated Trajectory",
+            "Correlation Peak",
+            "Truth Error and GNSS Status",
+        ),
+    )
+    if any(value is not None for value in truth_lons) and any(value is not None for value in truth_lats):
+        figure.add_trace(
+            go.Scatter(
+                x=truth_lons,
+                y=truth_lats,
+                mode="lines",
+                name="Truth trajectory",
+                line={"color": "#f4f7fb", "width": 3},
+            ),
+            row=1,
+            col=1,
+        )
+    figure.add_trace(
+        go.Scatter(
+            x=estimated_lons,
+            y=estimated_lats,
+            mode="lines+markers",
+            name="Estimated trajectory",
+            line={"color": "#2d9cdb", "width": 3},
+            marker={"size": 5},
+        ),
+        row=1,
+        col=1,
+    )
+    if gnss_loss_index is not None:
+        figure.add_trace(
+            go.Scatter(
+                x=[truth_lons[gnss_loss_index] if truth_lons[gnss_loss_index] is not None else estimated_lons[gnss_loss_index]],
+                y=[truth_lats[gnss_loss_index] if truth_lats[gnss_loss_index] is not None else estimated_lats[gnss_loss_index]],
+                mode="markers+text",
+                name="GNSS loss event",
+                marker={"color": "#ffd166", "size": 13, "symbol": "x"},
+                text=["GNSS LOST"],
+                textposition="top center",
+            ),
+            row=1,
+            col=1,
+        )
+
+    figure.add_trace(
+        go.Scatter(
+            x=timestamps,
+            y=correlation_peaks,
+            mode="lines+markers",
+            name="Correlation peak",
+            line={"color": "#27ae60", "width": 3},
+            marker={"size": 5},
+        ),
+        row=2,
+        col=1,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=timestamps,
+            y=truth_errors,
+            mode="lines",
+            name="Truth error, m",
+            line={"color": "#ff6b6b", "width": 3},
+        ),
+        row=3,
+        col=1,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=timestamps,
+            y=[0 if available else 1 for available in gnss_available],
+            mode="lines",
+            name="GNSS lost flag",
+            line={"color": "#ffd166", "width": 2, "shape": "hv"},
+            yaxis="y4",
+        ),
+        row=3,
+        col=1,
+    )
+
+    if gnss_loss_time is not None:
+        for row in (2, 3):
+            figure.add_vline(
+                x=gnss_loss_time,
+                line={"color": "#ffd166", "dash": "dash", "width": 2},
+                row=row,
+                col=1,
+            )
+
+    final = records[-1]
+    summary = (
+        f"Final mode: {final['mode']}<br>"
+        f"GNSS: {'ON' if final['gnss_available'] else 'OFF'}<br>"
+        f"Final error: {float(final['truth_error_m']):.1f} m<br>"
+        f"Peak correlation: {float(final['correlation_peak']):.3f}<br>"
+        f"Best azimuth: {float(final['best_azimuth_deg']):.1f} deg<br>"
+        f"Best offset: {float(final['best_offset_m']):.0f} m"
+    )
+    figure.update_layout(
+        template="plotly_dark",
+        title="TERRAIN NAVIGATOR Demo Report",
+        height=1000,
+        annotations=[
+            *list(figure.layout.annotations),
+            {
+                "xref": "paper",
+                "yref": "paper",
+                "x": 0.99,
+                "y": 0.99,
+                "showarrow": False,
+                "align": "right",
+                "text": summary,
+                "font": {"size": 13},
+                "bgcolor": "rgba(16, 24, 32, 0.75)",
+                "bordercolor": "#2d9cdb",
+                "borderwidth": 1,
+            },
+        ],
+        legend={"orientation": "h", "y": 1.03, "x": 0.0},
+    )
+    figure.update_xaxes(title_text="Longitude", row=1, col=1)
+    figure.update_yaxes(title_text="Latitude", row=1, col=1)
+    figure.update_xaxes(title_text="Time, s", row=2, col=1)
+    figure.update_yaxes(title_text="Correlation", row=2, col=1)
+    figure.update_xaxes(title_text="Time, s", row=3, col=1)
+    figure.update_yaxes(title_text="Error, m", row=3, col=1)
+
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    offline_plot(figure, filename=str(output_path), auto_open=False, include_plotlyjs="cdn")
+
+
 class TerrainNavigatorDash:
     """Real-time Plotly Dash dashboard for TERRAIN NAVIGATOR state updates."""
 
@@ -101,7 +257,14 @@ class TerrainNavigatorDash:
             },
             children=[
                 html.H1("TERRAIN NAVIGATOR", style={"marginBottom": "12px"}),
-                dcc.Store(id="history-store", data={"history": []}),
+                dcc.Store(
+                    id="history-store",
+                    data={
+                        "estimated_history": [],
+                        "truth_history": [],
+                        "gnss_loss_event": None,
+                    },
+                ),
                 dcc.Interval(id="dashboard-interval", interval=500, n_intervals=0),
                 html.Div(
                     style={
@@ -152,45 +315,117 @@ class TerrainNavigatorDash:
         except queue.Empty:
             return no_update, no_update, no_update, no_update, no_update
 
-        store = data_store or {"history": []}
-        history = list(store.get("history", []))
+        store = data_store or {
+            "estimated_history": [],
+            "truth_history": [],
+            "gnss_loss_event": None,
+        }
+        estimated_history = list(store.get("estimated_history", store.get("history", [])))
+        truth_history = list(store.get("truth_history", []))
         fix = state["fix"]
-        history.append(
+        sample = state.get("sample")
+        gnss_available = bool(state.get("gnss_available", True))
+        mode = str(state.get("mode", "GNSS" if gnss_available else "TERRAIN_NAV"))
+        timestamp = float(getattr(sample, "timestamp", len(estimated_history)))
+
+        estimated_history.append(
             {
                 "lat": float(fix.lat),
                 "lon": float(fix.lon),
                 "speed_mps": float(fix.speed_mps),
                 "azimuth_deg": float(fix.azimuth_deg),
                 "dominant_mode": str(fix.dominant_mode),
+                "timestamp": timestamp,
+                "mode": mode,
+                "gnss_available": gnss_available,
             }
         )
-        store["history"] = history[-500:]
+        truth_lat = (
+            getattr(sample, "effective_truth_lat", getattr(sample, "truth_lat", getattr(sample, "lat", None)))
+            if sample is not None
+            else None
+        )
+        truth_lon = (
+            getattr(sample, "effective_truth_lon", getattr(sample, "truth_lon", getattr(sample, "lon", None)))
+            if sample is not None
+            else None
+        )
+        if truth_lat is not None and truth_lon is not None:
+            truth_history.append(
+                {
+                    "lat": float(truth_lat),
+                    "lon": float(truth_lon),
+                    "timestamp": timestamp,
+                    "gnss_available": gnss_available,
+                }
+            )
 
-        heatmap_figure = self._build_correlation_figure(state["corr"])
-        terrain_map_figure = self._build_map_figure(state, store["history"])
+        previous = estimated_history[-2] if len(estimated_history) > 1 else None
+        if (
+            store.get("gnss_loss_event") is None
+            and previous is not None
+            and bool(previous.get("gnss_available", True))
+            and not gnss_available
+        ):
+            store["gnss_loss_event"] = {
+                "timestamp": timestamp,
+                "lat": float(truth_lat if truth_lat is not None else fix.lat),
+                "lon": float(truth_lon if truth_lon is not None else fix.lon),
+            }
+
+        store["estimated_history"] = estimated_history[-500:]
+        store["truth_history"] = truth_history[-500:]
+        store["history"] = store["estimated_history"]
+
+        heatmap_figure = self._build_correlation_figure(state.get("corr"), state)
+        terrain_map_figure = self._build_map_figure(state, store)
         profiles_figure = self._build_profiles_figure(state)
-        telemetry_figure = self._build_telemetry_figure(state)
+        telemetry_figure = self._build_telemetry_figure(state, store)
         return heatmap_figure, terrain_map_figure, profiles_figure, telemetry_figure, store
 
-    def _build_correlation_figure(self, corr: CorrelationResult) -> go.Figure:
-        heatmap = build_heatmap(corr)
-        x_offsets = np.arange(heatmap.shape[1], dtype=float) * (
-            corr.best_offset_m / max(corr.best_offset_steps, 1)
-            if corr.best_offset_steps > 0
-            else 30.0
-        )
+    def _build_correlation_figure(self, corr: CorrelationResult | None, state: dict[str, Any]) -> go.Figure:
+        incoming_heatmap = state.get("correlation_heatmap")
+        if corr is None and incoming_heatmap is None:
+            figure = go.Figure()
+            figure.update_layout(
+                template="plotly_dark",
+                title="Correlation Heatmap | unavailable",
+                xaxis_title="Offset",
+                yaxis_title="Azimuth",
+            )
+            return figure
+
+        if corr is not None:
+            heatmap = build_heatmap(corr)
+            best_offset_m = corr.best_offset_m
+            best_azimuth_deg = corr.best_azimuth_deg
+            peak_correlation = corr.peak_correlation
+            azimuth_axis = corr.azimuths_deg
+            x_offsets = np.arange(heatmap.shape[1], dtype=float) * (
+                corr.best_offset_m / max(corr.best_offset_steps, 1)
+                if corr.best_offset_steps > 0
+                else 30.0
+            )
+        else:
+            heatmap = np.asarray(incoming_heatmap, dtype=float)
+            best_offset_m = float(state.get("best_offset_m", 0.0))
+            best_azimuth_deg = float(state.get("best_azimuth_deg", 0.0))
+            peak_correlation = float(state.get("correlation_score", 0.0))
+            azimuth_axis = np.arange(heatmap.shape[0], dtype=float)
+            x_offsets = np.arange(heatmap.shape[1], dtype=float)
+
         figure = go.Figure(
             data=[
                 go.Heatmap(
                     z=heatmap,
                     x=x_offsets,
-                    y=corr.azimuths_deg,
+                    y=azimuth_axis,
                     colorscale="Viridis",
                     colorbar={"title": "r norm"},
                 ),
                 go.Scatter(
-                    x=[corr.best_offset_m],
-                    y=[corr.best_azimuth_deg],
+                    x=[best_offset_m],
+                    y=[best_azimuth_deg],
                     mode="markers",
                     marker={"color": "#ff5a5f", "symbol": "star", "size": 14},
                     name="Peak",
@@ -199,34 +434,55 @@ class TerrainNavigatorDash:
         )
         figure.update_layout(
             template="plotly_dark",
-            title=f"Корреляция r(theta, s) | Макс: {corr.peak_correlation:.3f} @ {corr.best_azimuth_deg:.0f}°",
+            title=f"Correlation Heatmap | Peak: {peak_correlation:.3f} @ {best_azimuth_deg:.0f} deg",
             xaxis_title="Смещение, м",
             yaxis_title="Азимут, град",
             margin={"l": 40, "r": 20, "t": 60, "b": 40},
         )
         return figure
 
-    def _build_map_figure(self, state: dict[str, Any], history: list[dict[str, Any]]) -> go.Figure:
+    def _build_map_figure(self, state: dict[str, Any], store: dict[str, Any]) -> go.Figure:
         patch = np.asarray(state.get("dem_patch", np.zeros((2, 2), dtype=float)), dtype=float)
         fix: IMMResult = state["fix"]
+        estimated_history = list(store.get("estimated_history", []))
+        truth_history = list(store.get("truth_history", []))
+        extent = state.get("dem_extent")
+        x_axis = None
+        y_axis = None
+        if extent is not None and patch.size:
+            x_axis = np.linspace(float(extent["left"]), float(extent["right"]), patch.shape[1])
+            y_axis = np.linspace(float(extent["top"]), float(extent["bottom"]), patch.shape[0])
         figure = go.Figure()
-        figure.add_trace(
-            go.Heatmap(
-                z=patch,
-                colorscale="Earth",
-                opacity=0.8,
-                showscale=False,
-                name="DEM patch",
+        if patch.size:
+            figure.add_trace(
+                go.Heatmap(
+                    z=patch,
+                    x=x_axis,
+                    y=y_axis,
+                    colorscale="Earth",
+                    opacity=0.8,
+                    showscale=False,
+                    name="DEM patch",
+                )
             )
-        )
+        if truth_history:
+            figure.add_trace(
+                go.Scatter(
+                    x=[entry["lon"] for entry in truth_history],
+                    y=[entry["lat"] for entry in truth_history],
+                    mode="lines",
+                    line={"color": "#f4f7fb", "width": 3},
+                    name="Truth trajectory",
+                )
+            )
         figure.add_trace(
             go.Scatter(
-                x=[entry["lon"] for entry in history],
-                y=[entry["lat"] for entry in history],
+                x=[entry["lon"] for entry in estimated_history],
+                y=[entry["lat"] for entry in estimated_history],
                 mode="lines+markers",
                 line={"color": "#2d9cdb", "width": 3},
                 marker={"size": 6},
-                name="Trajectory",
+                name="Estimated trajectory",
             )
         )
         figure.add_trace(
@@ -238,20 +494,36 @@ class TerrainNavigatorDash:
                 name="Current position",
             )
         )
+        gnss_loss_event = store.get("gnss_loss_event")
+        if gnss_loss_event is not None:
+            figure.add_trace(
+                go.Scatter(
+                    x=[gnss_loss_event["lon"]],
+                    y=[gnss_loss_event["lat"]],
+                    mode="markers+text",
+                    marker={"color": "#ffd166", "size": 13, "symbol": "x"},
+                    text=["GNSS LOST"],
+                    textposition="top center",
+                    name="GNSS loss event",
+                )
+            )
+        gnss_status = "GNSS ON" if state.get("gnss_available", True) else "GNSS OFF"
+        primary_mode = f"NAV MODE: {state.get('mode', 'INIT')}"
         figure.update_layout(
             template="plotly_dark",
-            title="Карта высот и траектория",
+            title=f"DEM Map | {gnss_status} | {primary_mode}",
             xaxis_title="Longitude",
             yaxis_title="Latitude",
             margin={"l": 40, "r": 20, "t": 60, "b": 40},
             shapes=create_arrow_shape(fix.lat, fix.lon, fix.azimuth_deg),
+            legend={"orientation": "h", "y": 1.02, "x": 0.0},
         )
         return figure
 
     def _build_profiles_figure(self, state: dict[str, Any]) -> go.Figure:
         h_meas = np.asarray(state.get("h_meas", np.array([], dtype=float)), dtype=float)
         best_ref = np.asarray(state.get("ref", np.array([], dtype=float)), dtype=float)
-        corr: CorrelationResult = state["corr"]
+        corr = state.get("corr")
         x_axis = np.arange(h_meas.size, dtype=float) * 30.0
         figure = go.Figure()
         figure.add_trace(
@@ -283,7 +555,7 @@ class TerrainNavigatorDash:
                     "y": 0.95,
                     "xref": "paper",
                     "yref": "paper",
-                    "text": f"r={corr.peak_correlation:.3f}",
+                    "text": f"r={float(state.get('correlation_score', getattr(corr, 'peak_correlation', 0.0))):.3f}",
                     "showarrow": False,
                     "font": {"size": 14, "color": "#f4f7fb"},
                 }
@@ -292,9 +564,21 @@ class TerrainNavigatorDash:
         )
         return figure
 
-    def _build_telemetry_figure(self, state: dict[str, Any]) -> go.Figure:
+    def _build_telemetry_figure(self, state: dict[str, Any], store: dict[str, Any]) -> go.Figure:
         fix: IMMResult = state["fix"]
         hdop = float(state.get("hdop", math.sqrt(max(np.trace(fix.covariance[0:2, 0:2]), 0.0))))
+        corr = state.get("corr")
+        gnss_available = bool(state.get("gnss_available", True))
+        terrain_active = bool(state.get("terrain_active", False))
+        mode = str(state.get("mode", "GNSS" if gnss_available else "TERRAIN_NAV"))
+        truth_error_m = state.get("truth_error_m")
+        gnss_text = "GNSS ON" if gnss_available else "GNSS OFF"
+        mode_text = f"NAV MODE: {mode}"
+        banner = (
+            "GNSS signal lost, switching to terrain-based correction"
+            if terrain_active
+            else "GNSS aiding active, terrain matching running in parallel"
+        )
         figure = go.Figure()
         figure.add_trace(
             go.Bar(
@@ -317,23 +601,32 @@ class TerrainNavigatorDash:
                 },
             )
         )
+        truth_error_value = float(truth_error_m) if truth_error_m is not None else float("nan")
         figure.update_layout(
             template="plotly_dark",
-            title="Телеметрия IMM",
+            title=f"System State | {gnss_text} | {mode_text}",
             margin={"l": 40, "r": 20, "t": 60, "b": 40},
             annotations=[
                 {
                     "xref": "paper",
                     "yref": "paper",
                     "x": 0.02,
-                    "y": 0.25,
+                    "y": 0.31,
                     "showarrow": False,
                     "align": "left",
                     "text": (
+                        f"{gnss_text}<br>"
+                        f"{mode_text}<br>"
+                        f"{banner}<br><br>"
                         f"Lat: {fix.lat:.6f}<br>"
                         f"Lon: {fix.lon:.6f}<br>"
-                        f"Azimuth: {fix.azimuth_deg:.1f}°<br>"
-                        f"Mode: {fix.dominant_mode}<br>"
+                        f"Estimated speed: {fix.speed_mps:.1f} m/s<br>"
+                        f"Estimated heading: {fix.azimuth_deg:.1f}°<br>"
+                        f"Best azimuth: {float(getattr(corr, 'best_azimuth_deg', state.get('best_azimuth_deg', 0.0))):.1f}°<br>"
+                        f"Best offset: {float(getattr(corr, 'best_offset_m', state.get('best_offset_m', 0.0))):.0f} m<br>"
+                        f"Correlation peak: {float(state.get('correlation_score', getattr(corr, 'peak_correlation', 0.0))):.3f}<br>"
+                        f"Truth error: {truth_error_value:.1f} m<br>"
+                        f"IMM model: {fix.dominant_mode}<br>"
                         f"HDOP: {hdop:.1f} m"
                     ),
                     "font": {"size": 13},

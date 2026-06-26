@@ -1,5 +1,7 @@
 __pycache__/
 .pytest_cache/
+.venv/
+terrain_nav_core/build/
 *.pyc
 output/
 terrain_navigator.log

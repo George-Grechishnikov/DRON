@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import queue
 import signal
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, List
 
@@ -20,11 +21,11 @@ import pyproj
 from correlator import Correlator, CorrelationResult
 from dem_loader import DEMLoader
 from imm_filter import IMMFilter, IMMResult
-from nmea_parser import NMEAFrame, NMEAReader, parse_line
+from nmea_parser import NMEAFrame, NMEAReader
 from position_solver import PositionEstimate, PositionSolver
 from profile_extractor import ProfileExtractor, is_flat_terrain
-from sim_generator import SimulationConfig, TrajectoryPoint, format_gpgga, generate_points
-from visualizer import TerrainNavigatorDash, export_flight_report
+from sim_generator import SimulationConfig, TrajectoryPoint, generate_points
+from visualizer import TerrainNavigatorDash, export_demo_report, export_flight_report
 
 
 LOGGER = logging.getLogger(__name__)
@@ -40,6 +41,7 @@ class Config:
     start_lon: float
     trajectory: int
     nmea_path: Path | None
+    samples_path: Path | None
     gt_path: Path | None
     udp_host: str
     udp_port: int
@@ -57,15 +59,76 @@ class Config:
     max_offset_m: float = 2000.0
     flat_terrain_threshold_m: float = 15.0
     cold_start_windows: int = 3
+    gnss_drop_after_s: float | None = None
+    report_path: Path = Path("output") / "terrain_navigator_report.html"
     log_level: str = "INFO"
 
 
 @dataclass(frozen=True)
-class FramePacket:
-    """Frame packet moving through producer/pipeline queues."""
+class UnifiedSample:
+    """Sample contract shared by simulation, replay, live adapters, and SITL."""
+
+    timestamp_s: float
+    lat: float | None
+    lon: float | None
+    alt_msl: float
+    radar_alt_m: float
+    terrain_h: float | None = None
+    heading_deg: float | None = None
+    speed_mps: float | None = None
+    gnss_available: bool = True
+    nav_mode: str = "INIT"
+    truth_lat: float | None = None
+    truth_lon: float | None = None
+    estimated_lat: float | None = None
+    estimated_lon: float | None = None
+    correlation_score: float | None = None
+    correlation_heatmap: object | None = None
+    best_azimuth_deg: float | None = None
+    best_offset_m: float | None = None
+
+    @property
+    def timestamp(self) -> float:
+        return float(self.timestamp_s)
+
+    @property
+    def ground_speed_mps(self) -> float | None:
+        return self.speed_mps
+
+    @property
+    def has_position(self) -> bool:
+        return self.lat is not None and self.lon is not None
+
+    @property
+    def has_truth_position(self) -> bool:
+        return self.truth_lat is not None and self.truth_lon is not None
+
+    @property
+    def effective_truth_lat(self) -> float | None:
+        return self.truth_lat if self.truth_lat is not None else self.lat
+
+    @property
+    def effective_truth_lon(self) -> float | None:
+        return self.truth_lon if self.truth_lon is not None else self.lon
+
+    @property
+    def effective_heading_deg(self) -> float:
+        return float(self.heading_deg if self.heading_deg is not None else 0.0)
+
+    @property
+    def effective_speed_mps(self) -> float:
+        return float(self.speed_mps if self.speed_mps is not None else 0.0)
+
+    def with_updates(self, **changes: Any) -> "UnifiedSample":
+        return replace(self, **changes)
+
+
+@dataclass(frozen=True)
+class SamplePacket:
+    """Unified sample packet moving through producer/pipeline queues."""
 
     index: int
-    frame: NMEAFrame
+    sample: UnifiedSample
 
 
 @dataclass(frozen=True)
@@ -99,6 +162,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     mode_group.add_argument("--sim", action="store_true", help="Simulation mode")
     mode_group.add_argument("--live", action="store_true", help="Live UDP mode")
     mode_group.add_argument("--replay", action="store_true", help="Replay NMEA log mode")
+    mode_group.add_argument("--samples-jsonl", "--unified-stream", type=Path, help="Replay unified sample JSONL stream")
 
     parser.add_argument("--dem", required=True, type=Path, help="Path to DEM GeoTIFF")
     parser.add_argument("--lat", type=float, default=60.5, help="Initial latitude")
@@ -122,6 +186,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-offset", type=float, default=2000.0, help="Maximum correlation offset in meters")
     parser.add_argument("--flat-threshold", type=float, default=15.0, help="Flat-terrain threshold in meters")
     parser.add_argument("--cold-start-windows", type=int, default=3, help="Windows before GNSS-like binding starts")
+    parser.add_argument(
+        "--gnss-drop-after",
+        type=float,
+        help="Set unified samples to GNSS unavailable after this many seconds",
+    )
+    parser.add_argument(
+        "--report-path",
+        type=Path,
+        default=Path("output") / "terrain_navigator_report.html",
+        help="HTML report output path",
+    )
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     return parser
 
@@ -134,7 +209,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     if args.replay and args.nmea is None:
         parser.error("--nmea is required in replay mode")
 
-    mode = "sim" if args.sim else "live" if args.live else "replay"
+    mode = "sim" if args.sim else "live" if args.live else "samples" if args.samples_jsonl else "replay"
     return Config(
         mode=mode,
         dem_path=args.dem,
@@ -142,6 +217,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         start_lon=args.lon,
         trajectory=args.trajectory,
         nmea_path=args.nmea,
+        samples_path=args.samples_jsonl,
         gt_path=args.gt,
         udp_host=args.udp_host,
         udp_port=args.udp_port,
@@ -159,6 +235,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         max_offset_m=args.max_offset,
         flat_terrain_threshold_m=args.flat_threshold,
         cold_start_windows=args.cold_start_windows,
+        gnss_drop_after_s=args.gnss_drop_after,
+        report_path=args.report_path,
         log_level=args.log_level,
     )
 
@@ -308,8 +386,108 @@ def build_sim_ground_truth(points: list[TrajectoryPoint]) -> list[GroundTruthPoi
     return gt_points
 
 
-def enqueue_frame(frame_queue: queue.Queue, packet: FramePacket, stop_event: threading.Event) -> None:
-    """Push one frame packet into the queue with graceful shutdown support."""
+def _gnss_available_at(timestamp_s: float, config: Config) -> bool:
+    """Return the sample-level GNSS availability flag for demo playback."""
+
+    return config.gnss_drop_after_s is None or timestamp_s < config.gnss_drop_after_s
+
+
+def _sample_from_nmea_frame(
+    frame: NMEAFrame,
+    index: int,
+    config: Config,
+    gt_by_index: dict[int, GroundTruthPoint] | None = None,
+) -> UnifiedSample:
+    """Adapt legacy radar-only NMEA frames into the unified sample contract."""
+
+    gt = gt_by_index.get(index) if gt_by_index is not None else None
+    timestamp_s = gt.timestamp_s if gt is not None else index / config.freq_hz
+    has_trusted_position = gt is not None
+    return UnifiedSample(
+        timestamp_s=float(timestamp_s),
+        lat=float(gt.lat if gt is not None else config.start_lat),
+        lon=float(gt.lon if gt is not None else config.start_lon),
+        alt_msl=float(config.altitude_msl_m),
+        terrain_h=None,
+        heading_deg=float(gt.azimuth_deg if gt is not None else 45.0),
+        speed_mps=float(gt.speed_mps if gt is not None and gt.speed_mps > 0.0 else config.speed_mps),
+        radar_alt_m=float(frame.radar_alt_m),
+        nav_mode="GNSS" if has_trusted_position and _gnss_available_at(float(timestamp_s), config) else "INIT",
+        gnss_available=has_trusted_position and _gnss_available_at(float(timestamp_s), config),
+        truth_lat=float(gt.lat) if gt is not None else None,
+        truth_lon=float(gt.lon) if gt is not None else None,
+    )
+
+
+def _samples_from_sim_points(points: list[TrajectoryPoint], config: Config) -> list[UnifiedSample]:
+    """Convert simulated trajectory points into unified samples."""
+
+    geod = pyproj.Geod(ellps="WGS84")
+    samples: list[UnifiedSample] = []
+    for idx, point in enumerate(points):
+        if idx == 0:
+            heading_deg = 45.0
+            speed_mps = config.speed_mps
+        else:
+            prev = points[idx - 1]
+            heading_deg, _, distance_m = geod.inv(prev.lon, prev.lat, point.lon, point.lat)
+            dt = max(point.timestamp_s - prev.timestamp_s, 1e-6)
+            speed_mps = distance_m / dt
+            heading_deg = float(heading_deg % 360.0)
+        samples.append(
+            UnifiedSample(
+                timestamp_s=float(point.timestamp_s),
+                lat=float(point.lat),
+                lon=float(point.lon),
+                alt_msl=float(point.alt_msl),
+                terrain_h=float(point.terrain_h),
+                heading_deg=float(heading_deg),
+                speed_mps=float(speed_mps),
+                radar_alt_m=float(point.radar_alt_measured),
+                gnss_available=_gnss_available_at(float(point.timestamp_s), config),
+                nav_mode="GNSS" if _gnss_available_at(float(point.timestamp_s), config) else "TERRAIN_NAV",
+                truth_lat=float(point.lat),
+                truth_lon=float(point.lon),
+            )
+        )
+    return samples
+
+
+def coerce_unified_sample(sample: UnifiedSample | dict[str, Any]) -> UnifiedSample:
+    """Normalize bridge-emitted dicts into the internal unified sample dataclass."""
+
+    if isinstance(sample, UnifiedSample):
+        return sample
+    timestamp_s = sample.get("timestamp_s", sample.get("timestamp"))
+    speed_mps = sample.get("speed_mps", sample.get("ground_speed_mps"))
+    return UnifiedSample(
+        timestamp_s=float(timestamp_s),
+        lat=None if sample.get("lat") is None else float(sample["lat"]),
+        lon=None if sample.get("lon") is None else float(sample["lon"]),
+        alt_msl=float(sample["alt_msl"]),
+        terrain_h=None if sample.get("terrain_h") is None else float(sample["terrain_h"]),
+        heading_deg=None if sample.get("heading_deg") is None else float(sample["heading_deg"]),
+        speed_mps=None if speed_mps is None else float(speed_mps),
+        radar_alt_m=float(sample["radar_alt_m"]),
+        gnss_available=bool(sample["gnss_available"]),
+        nav_mode=str(sample.get("nav_mode", "GNSS" if sample.get("gnss_available", True) else "TERRAIN_NAV")),
+        truth_lat=None if sample.get("truth_lat") is None else float(sample["truth_lat"]),
+        truth_lon=None if sample.get("truth_lon") is None else float(sample["truth_lon"]),
+        estimated_lat=None if sample.get("estimated_lat") is None else float(sample["estimated_lat"]),
+        estimated_lon=None if sample.get("estimated_lon") is None else float(sample["estimated_lon"]),
+        correlation_score=None
+        if sample.get("correlation_score") is None
+        else float(sample["correlation_score"]),
+        correlation_heatmap=sample.get("correlation_heatmap"),
+        best_azimuth_deg=None
+        if sample.get("best_azimuth_deg") is None
+        else float(sample["best_azimuth_deg"]),
+        best_offset_m=None if sample.get("best_offset_m") is None else float(sample["best_offset_m"]),
+    )
+
+
+def enqueue_sample(frame_queue: queue.Queue, packet: SamplePacket, stop_event: threading.Event) -> None:
+    """Push one unified sample packet into the queue with graceful shutdown support."""
 
     while not stop_event.is_set():
         try:
@@ -319,21 +497,59 @@ def enqueue_frame(frame_queue: queue.Queue, packet: FramePacket, stop_event: thr
             continue
 
 
+def unified_sample_producer(
+    samples: Iterable[UnifiedSample | dict[str, Any]],
+    frame_queue: queue.Queue,
+    stop_event: threading.Event,
+) -> None:
+    """Feed any unified sample stream into the main pipeline queue."""
+
+    for index, sample in enumerate(samples):
+        if stop_event.is_set():
+            break
+        enqueue_sample(frame_queue, SamplePacket(index=index, sample=coerce_unified_sample(sample)), stop_event)
+
+
+def load_unified_samples_jsonl(path: Path) -> Iterable[dict[str, Any]]:
+    """Yield unified sample dicts from a JSONL stream capture."""
+
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON on unified sample line {line_number}: {exc}") from exc
+            if not isinstance(payload, dict):
+                raise ValueError(f"Unified sample line {line_number} must be a JSON object")
+            yield payload
+
+
+def samples_jsonl_producer(
+    config: Config,
+    frame_queue: queue.Queue,
+    stop_event: threading.Event,
+) -> None:
+    """Produce unified samples from a JSONL stream capture."""
+
+    assert config.samples_path is not None
+    unified_sample_producer(load_unified_samples_jsonl(config.samples_path), frame_queue, stop_event)
+
+
 def simulation_producer(
     config: Config,
     frame_queue: queue.Queue,
     stop_event: threading.Event,
 ) -> list[GroundTruthPoint]:
-    """Produce NMEA frames from the simulation generator."""
+    """Produce unified samples from the simulation generator."""
 
     points = make_simulation_points(config)
-    for point in points:
+    for point, sample in zip(points, _samples_from_sim_points(points, config)):
         if stop_event.is_set():
             break
-        frame = parse_line(format_gpgga(point.timestamp_s, point.radar_alt_measured))
-        if frame is None:
-            continue
-        enqueue_frame(frame_queue, FramePacket(index=point.index, frame=frame), stop_event)
+        enqueue_sample(frame_queue, SamplePacket(index=point.index, sample=sample), stop_event)
     return build_sim_ground_truth(points)
 
 
@@ -342,17 +558,21 @@ def replay_producer(
     frame_queue: queue.Queue,
     stop_event: threading.Event,
 ) -> None:
-    """Produce frames from a recorded NMEA log."""
+    """Produce unified samples from a recorded NMEA log."""
 
     assert config.nmea_path is not None
+    gt_by_index: dict[int, GroundTruthPoint] | None = None
+    if config.gt_path is not None:
+        gt_by_index = {point.index: point for point in load_ground_truth_csv(config.gt_path)}
     reader = NMEAReader.from_file(config.nmea_path)
     try:
         valid_index = 0
         for frame in reader:
             if stop_event.is_set():
                 break
-            enqueue_frame(frame_queue, FramePacket(index=valid_index, frame=frame), stop_event)
             if frame.valid:
+                sample = _sample_from_nmea_frame(frame, valid_index, config, gt_by_index)
+                enqueue_sample(frame_queue, SamplePacket(index=valid_index, sample=sample), stop_event)
                 valid_index += 1
     finally:
         reader.close()
@@ -363,7 +583,7 @@ def live_producer(
     frame_queue: queue.Queue,
     stop_event: threading.Event,
 ) -> None:
-    """Produce frames from a live UDP stream."""
+    """Produce unified samples from a legacy live UDP NMEA stream."""
 
     reader = NMEAReader.from_udp(config.udp_host, config.udp_port)
     valid_index = 0
@@ -372,8 +592,9 @@ def live_producer(
             got_frame = False
             for frame in reader:
                 got_frame = True
-                enqueue_frame(frame_queue, FramePacket(index=valid_index, frame=frame), stop_event)
                 if frame.valid:
+                    sample = _sample_from_nmea_frame(frame, valid_index, config)
+                    enqueue_sample(frame_queue, SamplePacket(index=valid_index, sample=sample), stop_event)
                     valid_index += 1
             if not got_frame:
                 time.sleep(0.05)
@@ -405,6 +626,36 @@ def predict_fix(
     )
 
 
+def normalize_nav_mode(sample: UnifiedSample) -> str:
+    """Normalize navigation mode labels for UI and future bridge compatibility."""
+
+    mode = sample.nav_mode.strip().upper() if sample.nav_mode else ""
+    if mode == "TERRAIN":
+        mode = "TERRAIN_NAV"
+    if mode:
+        return mode
+    if sample.gnss_available and sample.has_position:
+        return "GNSS"
+    if sample.has_position or sample.effective_truth_lat is not None:
+        return "TERRAIN_NAV"
+    return "INIT"
+
+
+def sample_position_fix(sample: UnifiedSample, confidence: float = 1.0) -> PositionEstimate:
+    """Create a primary GNSS fix from a unified sample."""
+
+    return PositionEstimate(
+        lat=float(sample.lat if sample.lat is not None else 0.0),
+        lon=float(sample.lon if sample.lon is not None else 0.0),
+        speed_mps=float(sample.effective_speed_mps),
+        azimuth_deg=float(sample.effective_heading_deg % 360.0),
+        timestamp_s=float(sample.timestamp),
+        confidence=float(confidence),
+        is_reliable=True,
+        cov_matrix=np.diag([9.0, 9.0]).astype(float),
+    )
+
+
 def pipeline_worker(
     config: Config,
     frame_queue: queue.Queue,
@@ -412,12 +663,13 @@ def pipeline_worker(
     stop_event: threading.Event,
     pipeline_done_event: threading.Event,
     ground_truth: list[GroundTruthPoint] | None = None,
+    report_records: list[dict[str, Any]] | None = None,
 ) -> list[tuple[int, IMMResult]]:
     """Run the main sliding-window pipeline."""
 
     geod = pyproj.Geod(ellps="WGS84")
     history: list[tuple[int, IMMResult]] = []
-    buffer: deque[FramePacket] = deque(maxlen=config.window_size)
+    buffer: deque[SamplePacket] = deque(maxlen=config.window_size)
     window_start_lat = config.start_lat
     window_start_lon = config.start_lon
     current_azimuth = 45.0
@@ -455,10 +707,11 @@ def pipeline_worker(
             if len(buffer) < config.window_size:
                 continue
 
-            frames_window = [item.frame for item in buffer]
+            samples_window = [item.sample for item in buffer]
+            latest_sample = samples_window[-1]
             center_frame_index = buffer[-1].index
             h_meas = np.array(
-                [config.altitude_msl_m - frame.radar_alt_m for frame in frames_window],
+                [sample.alt_msl - sample.radar_alt_m for sample in samples_window],
                 dtype=float,
             )
             flat = is_flat_terrain(h_meas, threshold_m=config.flat_terrain_threshold_m)
@@ -469,7 +722,26 @@ def pipeline_worker(
                 azimuths_deg=np.arange(0.0, ref_matrix.shape[0], 1.0),
             )
 
-            if window_counter < config.cold_start_windows:
+            if latest_sample.correlation_heatmap is None:
+                latest_sample = latest_sample.with_updates(
+                    correlation_heatmap=corr_result.heatmap,
+                    correlation_score=corr_result.peak_correlation,
+                    best_azimuth_deg=corr_result.best_azimuth_deg,
+                    best_offset_m=corr_result.best_offset_m,
+                )
+
+            truth_lat = latest_sample.effective_truth_lat
+            truth_lon = latest_sample.effective_truth_lon
+            gnss_available = bool(latest_sample.gnss_available)
+            nav_mode = normalize_nav_mode(latest_sample)
+            trusted_gnss = gnss_available and latest_sample.has_position
+            if not trusted_gnss and nav_mode == "INIT" and window_counter >= config.cold_start_windows:
+                nav_mode = "TERRAIN_NAV"
+            primary_mode = nav_mode
+
+            if trusted_gnss:
+                position_fix = sample_position_fix(latest_sample, confidence=max(corr_result.confidence, 0.5))
+            elif window_counter < config.cold_start_windows:
                 position_fix = predict_fix(
                     current_lat=window_start_lat,
                     current_lon=window_start_lon,
@@ -487,20 +759,75 @@ def pipeline_worker(
                 )
 
             imm_result = imm.update(position_fix, dt=step_dt, is_flat=flat)
+            latest_sample = latest_sample.with_updates(
+                estimated_lat=float(imm_result.lat),
+                estimated_lon=float(imm_result.lon),
+            )
             current_azimuth = imm_result.azimuth_deg
             current_speed = imm_result.speed_mps
-            dem_patch, _ = dem.get_patch(imm_result.lat, imm_result.lon, radius_m=config.dem_patch_radius_m)
+            dem_patch, dem_transform = dem.get_patch(
+                imm_result.lat,
+                imm_result.lon,
+                radius_m=config.dem_patch_radius_m,
+            )
+            rows, cols = dem_patch.shape
+            left, top = dem_transform * (0, 0)
+            right, bottom = dem_transform * (cols, rows)
+            if truth_lat is not None and truth_lon is not None:
+                _, _, truth_error_m = geod.inv(imm_result.lon, imm_result.lat, truth_lon, truth_lat)
+                truth_error_value = float(truth_error_m)
+            else:
+                truth_error_value = float("nan")
 
             history.append((center_frame_index, imm_result))
+            if report_records is not None:
+                report_records.append(
+                    {
+                        "index": int(center_frame_index),
+                        "timestamp": float(latest_sample.timestamp),
+                        "estimated_lat": float(imm_result.lat),
+                        "estimated_lon": float(imm_result.lon),
+                        "truth_lat": None if truth_lat is None else float(truth_lat),
+                        "truth_lon": None if truth_lon is None else float(truth_lon),
+                        "estimated_speed_mps": float(imm_result.speed_mps),
+                        "estimated_heading_deg": float(imm_result.azimuth_deg),
+                        "gnss_available": gnss_available,
+                        "mode": primary_mode,
+                        "terrain_active": primary_mode == "TERRAIN_NAV",
+                        "truth_error_m": truth_error_value,
+                        "best_azimuth_deg": float(corr_result.best_azimuth_deg),
+                        "best_offset_m": float(corr_result.best_offset_m),
+                        "correlation_peak": float(latest_sample.correlation_score or corr_result.peak_correlation),
+                    }
+                )
             _enqueue_state(
                 state_queue,
                 {
                     "corr": corr_result,
                     "fix": imm_result,
+                    "sample": latest_sample,
+                    "truth": None
+                    if truth_lat is None or truth_lon is None
+                    else {"lat": float(truth_lat), "lon": float(truth_lon)},
+                    "estimated": {"lat": float(imm_result.lat), "lon": float(imm_result.lon)},
                     "h_meas": h_meas,
                     "ref": corr_result.best_reference_profile,
                     "dem_patch": dem_patch,
+                    "dem_extent": {
+                        "left": float(min(left, right)),
+                        "right": float(max(left, right)),
+                        "bottom": float(min(bottom, top)),
+                        "top": float(max(bottom, top)),
+                    },
                     "hdop": imm.get_hdop(),
+                    "gnss_available": gnss_available,
+                    "mode": primary_mode,
+                    "terrain_active": primary_mode == "TERRAIN_NAV",
+                    "truth_error_m": truth_error_value,
+                    "correlation_score": float(latest_sample.correlation_score or corr_result.peak_correlation),
+                    "correlation_heatmap": latest_sample.correlation_heatmap,
+                    "best_azimuth_deg": float(latest_sample.best_azimuth_deg or corr_result.best_azimuth_deg),
+                    "best_offset_m": float(latest_sample.best_offset_m or corr_result.best_offset_m),
                 },
                 stop_event,
             )
@@ -508,14 +835,18 @@ def pipeline_worker(
             for _ in range(min(config.step_size, len(buffer))):
                 if buffer:
                     buffer.popleft()
-            next_start_lon, next_start_lat, _ = geod.fwd(
-                window_start_lon,
-                window_start_lat,
-                current_azimuth,
-                current_speed * step_dt,
-            )
-            window_start_lat = float(next_start_lat)
-            window_start_lon = float(next_start_lon)
+            if trusted_gnss:
+                window_start_lat = float(latest_sample.lat if latest_sample.lat is not None else window_start_lat)
+                window_start_lon = float(latest_sample.lon if latest_sample.lon is not None else window_start_lon)
+            else:
+                next_start_lon, next_start_lat, _ = geod.fwd(
+                    window_start_lon,
+                    window_start_lat,
+                    current_azimuth,
+                    current_speed * step_dt,
+                )
+                window_start_lat = float(next_start_lat)
+                window_start_lon = float(next_start_lon)
             window_counter += 1
 
     return history
@@ -551,6 +882,7 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
         ground_truth = load_ground_truth_csv(config.gt_path)
 
     pipeline_history: list[tuple[int, IMMResult]] = []
+    report_records: list[dict[str, Any]] = []
     pipeline_metrics: ReplayMetrics | None = None
 
     def producer_target() -> None:
@@ -559,6 +891,8 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
                 simulation_producer(config, frame_queue, stop_event)
             elif config.mode == "replay":
                 replay_producer(config, frame_queue, stop_event)
+            elif config.mode == "samples":
+                samples_jsonl_producer(config, frame_queue, stop_event)
             else:
                 live_producer(config, frame_queue, stop_event)
         finally:
@@ -573,6 +907,7 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
             stop_event=stop_event,
             pipeline_done_event=producer_done_event,
             ground_truth=ground_truth,
+            report_records=report_records,
         )
         pipeline_done_event.set()
 
@@ -609,7 +944,7 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
         stop_event.set()
         signal.signal(signal.SIGINT, previous_handler)
 
-    if config.mode in {"sim", "replay"} and ground_truth is not None:
+    if config.mode in {"sim", "replay", "samples"} and ground_truth is not None:
         pipeline_metrics = compute_replay_metrics(pipeline_history, ground_truth)
         LOGGER.info(
             "Replay metrics | mean=%.2f m | max=%.2f m | rmse=%.2f m | speed=%.2f m/s | azimuth=%.2f deg",
@@ -621,8 +956,10 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
         )
 
     dashboard_history = [item for _, item in pipeline_history]
-    if dashboard_history:
-        export_flight_report(dashboard_history, str(Path("output") / "terrain_navigator_report.html"))
+    if report_records:
+        export_demo_report(report_records, str(config.report_path))
+    elif dashboard_history:
+        export_flight_report(dashboard_history, str(config.report_path))
     return pipeline_history, pipeline_metrics
 
 

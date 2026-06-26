@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from typing import Sequence
 
 import numpy as np
-from scipy.signal import correlate
 
+from correlation_fallback import find_best_match
 from nmea_parser import NMEAFrame, frames_to_profile
 from profile_extractor import normalize_profile
 
@@ -84,41 +84,18 @@ class Correlator:
         if usable_offsets <= 0:
             raise ValueError("No valid offsets available for the provided input sizes")
 
-        h_mean = float(np.nanmean(h_meas_array))
-        h_std = float(np.nanstd(h_meas_array))
-        if np.isnan(h_std) or h_std == 0.0:
-            raise ValueError("h_meas must have non-zero variance")
-        h_centered = h_meas_array - h_mean
-        window_length = h_meas_array.size
-        heatmap = np.empty((ref_array.shape[0], usable_offsets), dtype=float)
-
-        for row_index, ref_profile in enumerate(ref_array):
-            ref_values = np.asarray(ref_profile, dtype=float)
-            numerator = correlate(ref_values, h_centered, mode="valid")[:usable_offsets]
-            sums = np.convolve(ref_values, np.ones(window_length, dtype=float), mode="valid")[
-                :usable_offsets
-            ]
-            sums_sq = np.convolve(ref_values * ref_values, np.ones(window_length, dtype=float), mode="valid")[
-                :usable_offsets
-            ]
-            ref_mean = sums / window_length
-            ref_var = np.maximum((sums_sq / window_length) - (ref_mean * ref_mean), 0.0)
-            ref_std = np.sqrt(ref_var)
-            denominator = window_length * h_std * ref_std
-            corr_values = np.divide(
-                numerator,
-                denominator,
-                out=np.zeros_like(numerator, dtype=float),
-                where=denominator > 0,
-            )
-            heatmap[row_index, :] = corr_values
-
-        best_flat_index = int(np.nanargmax(heatmap))
-        best_row, best_col = np.unravel_index(best_flat_index, heatmap.shape)
+        backend_result = find_best_match(
+            h_meas_array,
+            ref_array,
+            max_offset_steps=max_offset_steps,
+        )
+        heatmap = np.asarray(backend_result["heatmap"], dtype=float)
+        best_row = int(backend_result["best_azimuth_idx"])
+        best_col = int(backend_result["best_offset_idx"])
         best_azimuth_deg = float(azimuth_axis[best_row])
         best_offset_steps = int(best_col)
         best_offset_m = best_offset_steps * self.step_m
-        peak = float(heatmap[best_row, best_col])
+        peak = float(backend_result["best_score"])
         confidence = self._compute_confidence(heatmap, peak)
         is_reliable = peak >= 0.5 and confidence >= 0.1
         best_reference_profile = ref_array[

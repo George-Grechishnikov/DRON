@@ -48,6 +48,7 @@ def test_full_sim_pipeline_produces_reasonable_metrics(tmp_path: Path, monkeypat
         start_lon=90.3,
         trajectory=1,
         nmea_path=None,
+        samples_path=None,
         gt_path=None,
         udp_host="127.0.0.1",
         udp_port=10110,
@@ -65,6 +66,7 @@ def test_full_sim_pipeline_produces_reasonable_metrics(tmp_path: Path, monkeypat
         max_offset_m=2000.0,
         flat_terrain_threshold_m=15.0,
         cold_start_windows=3,
+        report_path=Path("output") / "terrain_navigator_report.html",
         log_level="INFO",
     )
 

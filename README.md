@@ -30,7 +30,7 @@
 
 ## Требования
 
-- Python `3.12+`
+- Python `3.10+`
 - `numpy`
 - `rasterio`
 - `pyproj`
@@ -42,7 +42,17 @@
 Установка зависимостей:
 
 ```powershell
-python -m pip install --user numpy rasterio pyproj scipy pytest dash plotly
+python -m venv .venv
+.\.venv\Scripts\python -m pip install --upgrade pip
+.\.venv\Scripts\python -m pip install -r requirements.txt
+```
+
+macOS/Linux:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements.txt
 ```
 
 ## Структура проекта
@@ -234,7 +244,51 @@ print(fix.lat, fix.lon)
 print(fix.speed_mps, fix.azimuth_deg)
 ```
 
-### 7. IMM-фильтр
+### 7. Unified sample stream
+
+`main.py` умеет принимать единый поток samples, который потом можно напрямую
+использовать для стыковки с внешним источником телеметрии.
+
+Формат одного sample:
+
+```python
+{
+    "timestamp_s": 0.0,
+    "lat": 60.5,
+    "lon": 90.3,
+    "alt_msl": 1500.0,
+    "radar_alt_m": 1200.0,
+    "terrain_h": 300.0,
+    "heading_deg": 45.0,
+    "speed_mps": 50.0,
+    "gnss_available": True,
+    "nav_mode": "GNSS",
+    "truth_lat": 60.5,
+    "truth_lon": 90.3,
+    "estimated_lat": null,
+    "estimated_lon": null,
+    "correlation_score": null,
+    "correlation_heatmap": null
+}
+```
+
+Для проверки такого потока без live-источника можно сохранить samples в JSONL:
+одна строка — один JSON object.
+
+Пример запуска:
+
+```powershell
+python .\main.py `
+  --samples-jsonl .\output\samples.jsonl `
+  --dem .\data\dem.tif `
+  --gnss-drop-after 30
+```
+
+После `--gnss-drop-after` dashboard показывает `GNSS OFF` и
+`NAV MODE: TERRAIN_NAV`, а траектории truth/estimated продолжают
+отображаться вместе с correlation heatmap.
+
+### 8. IMM-фильтр
 
 `imm_filter.py` умеет:
 - смешивать три модели движения `hover / cruise / turn`
@@ -260,7 +314,7 @@ print(imm_result.model_weights)
 print(imm_result.dominant_mode)
 ```
 
-### 8. Визуализация
+### 9. Визуализация
 
 `visualizer.py` умеет:
 - поднимать `Plotly Dash` дашборд
@@ -268,6 +322,7 @@ print(imm_result.dominant_mode)
 - показывать 4 панели: heatmap, карту, профили и IMM telemetry
 - хранить историю траектории между тиками
 - экспортировать HTML-отчёт полёта
+- не падать без truth trajectory, DEM или incoming correlation heatmap
 
 Пример использования:
 
@@ -281,10 +336,11 @@ dashboard = TerrainNavigatorDash(state_queue=state_queue)
 dashboard.run(host="127.0.0.1", port=8050, debug=False)
 ```
 
-### 9. Главный оркестратор
+### 10. Главный оркестратор
 
 `main.py` умеет:
 - запускать проект в режимах `sim`, `live`, `replay`
+- запускать unified stream режим через `--samples-jsonl` / `--unified-stream`
 - поднимать producer/pipeline/dashboard потоки
 - крутить скользящее окно обработки
 - собирать состояние для `visualizer.py`
@@ -313,12 +369,44 @@ python .\main.py --sim --dem .\data\dem.tif --trajectory 1 --no-visualizer
 
 ## Как запускать то, что уже есть
 
+### Боевой preflight
+
+Перед демонстрацией или деплоем запустить полный preflight:
+
+```powershell
+.\.venv\Scripts\python .\scripts\preflight.py
+```
+
+macOS/Linux:
+
+```bash
+.venv/bin/python scripts/preflight.py
+```
+
+Preflight делает:
+- компиляцию основных Python-модулей
+- полный `pytest`
+- end-to-end smoke-run через `--samples-jsonl`
+- проверку создания `output/terrain_navigator_report.html`
+
+Если нужно быстро проверить только запуск без полного тестового набора:
+
+```powershell
+.\.venv\Scripts\python .\scripts\preflight.py --skip-tests
+```
+
 ### Проверка модулей тестами
 
 Запуск всех текущих тестов:
 
 ```powershell
-python -m pytest .\test_sim_generator.py .\test_nmea_parser.py .\test_dem_loader.py .\test_profile_extractor.py .\test_correlator.py .\test_position_solver.py .\test_imm_filter.py .\test_visualizer.py .\test_main.py -q
+.\.venv\Scripts\python -m pytest -q
+```
+
+Точечные тесты на unified stream и визуализацию:
+
+```powershell
+.\.venv\Scripts\python -m pytest .\test_main.py .\test_visualizer.py .\test_correlation_fallback.py -q
 ```
 
 Финальный интеграционный прогон:
@@ -359,6 +447,79 @@ python -m pytest .\integration_test.py -q
 7. `imm_filter.py` сглаживает решение по режимам движения
 8. `visualizer.py` показывает текущее состояние и историю
 9. `main.py` связывает всё в один рабочий pipeline
+
+## Боевой сценарий демо
+
+### Вариант A: unified JSONL replay
+
+Подходит для проверки будущего `sitl_bridge.py` без live-подключения.
+
+```powershell
+.\.venv\Scripts\python .\main.py `
+  --samples-jsonl .\output\samples.jsonl `
+  --dem .\data\dem.tif `
+  --report-path .\output\demo_report.html `
+  --dashboard-host 127.0.0.1 `
+  --dashboard-port 8050
+```
+
+Открыть dashboard:
+
+```text
+http://127.0.0.1:8050
+```
+
+### Вариант B: simulation demo с GNSS loss
+
+```powershell
+.\.venv\Scripts\python .\main.py `
+  --sim `
+  --dem .\data\dem.tif `
+  --trajectory 1 `
+  --lat 60.5 `
+  --lon 90.3 `
+  --gnss-drop-after 30 `
+  --report-path .\output\demo_gnss_loss.html `
+  --dashboard-host 127.0.0.1 `
+  --dashboard-port 8050
+```
+
+На dashboard должны быть видны:
+- `GNSS AVAILABLE` до события потери
+- `GNSS OFF` после события потери
+- `NAV MODE: TERRAIN_NAV`
+- truth trajectory и estimated trajectory
+- correlation heatmap с пиком
+- measured/reference terrain profiles
+
+## Сборка C++ ядра
+
+Опциональное C++ ядро лежит в `terrain_nav_core/` и не требуется для Python-only запуска.
+Если модуль не собран, проект автоматически использует `correlation_fallback.py`.
+
+Пример сборки:
+
+```bash
+python3 -m pip install pybind11
+cmake -S terrain_nav_core -B terrain_nav_core/build
+cmake --build terrain_nav_core/build --config Release
+```
+
+После сборки Python backend продолжит использовать тот же интерфейс:
+
+```python
+from correlation_fallback import find_best_match
+```
+
+## Чеклист перед показом
+
+1. Установлены зависимости из `requirements.txt`.
+2. `scripts/preflight.py` проходит без ошибок.
+3. DEM покрывает стартовую точку и весь маршрут.
+4. `--window-size`, `--step-size`, `--max-offset` соответствуют скорости и частоте samples.
+5. Dashboard открывается на `http://127.0.0.1:8050`.
+6. При GNSS loss отображаются `GNSS OFF` и `NAV MODE: TERRAIN_NAV`.
+7. В `output/terrain_navigator_report.html` или указанном `--report-path` создаётся отчёт после завершения прогона.
 
 ## Что осталось дальше
 
