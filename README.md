@@ -7,6 +7,7 @@
 - `nmea_parser.py` — парсер потока NMEA-0183
 - `dem_loader.py` — загрузчик DEM/ЦМР с выборкой высот и профилей
 - `profile_extractor.py` — построитель эталонных профилей рельефа
+- `correlator.py` — корреляционный движок для поиска лучшего азимута и смещения
 
 Этот `README` будем постепенно дополнять по мере реализации следующих задач.
 
@@ -46,10 +47,12 @@ DRON/
   nmea_parser.py
   dem_loader.py
   profile_extractor.py
+  correlator.py
   test_sim_generator.py
   test_nmea_parser.py
   test_dem_loader.py
   test_profile_extractor.py
+  test_correlator.py
 ```
 
 ## Что уже умеет проект
@@ -160,6 +163,36 @@ with DEMLoader("data/dem.tif") as dem:
     flat = is_flat_terrain(ref_matrix[45])
 ```
 
+### 5. Корреляционный движок
+
+`correlator.py` умеет:
+- сравнивать измеренный профиль `H_meas` с матрицей эталонных профилей
+- искать лучший `azimuth + offset`
+- считать `heatmap` корреляции для визуализации
+- оценивать `confidence` и флаг `is_reliable`
+- принимать буфер `NMEAFrame` напрямую через `sliding_window_compute()`
+
+Пример использования:
+
+```python
+import numpy as np
+
+from correlator import Correlator, build_heatmap
+
+correlator = Correlator(
+    profile_length_m=5000.0,
+    step_m=30.0,
+    max_offset_m=2000.0,
+)
+
+result = correlator.compute(h_meas, ref_matrix, azimuths_deg=np.arange(0, 360, 1.0))
+heatmap = build_heatmap(result)
+
+print(result.best_azimuth_deg)
+print(result.best_offset_m)
+print(result.peak_correlation)
+```
+
 ## Как запускать то, что уже есть
 
 ### Проверка модулей тестами
@@ -167,7 +200,7 @@ with DEMLoader("data/dem.tif") as dem:
 Запуск всех текущих тестов:
 
 ```powershell
-python -m pytest .\test_sim_generator.py .\test_nmea_parser.py .\test_dem_loader.py .\test_profile_extractor.py -q
+python -m pytest .\test_sim_generator.py .\test_nmea_parser.py .\test_dem_loader.py .\test_profile_extractor.py .\test_correlator.py -q
 ```
 
 ### Минимальный сценарий работы
@@ -177,6 +210,7 @@ python -m pytest .\test_sim_generator.py .\test_nmea_parser.py .\test_dem_loader
 3. Прочитать `.nmea` через `nmea_parser.py`
 4. Использовать `dem_loader.py` для получения профилей рельефа
 5. Построить эталонную матрицу через `profile_extractor.py`
+6. Найти лучший азимут и смещение через `correlator.py`
 
 ## Что будет добавлено дальше
 
