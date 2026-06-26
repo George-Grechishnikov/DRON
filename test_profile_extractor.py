@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from profile_extractor import ProfileExtractor, is_flat_terrain, normalize_profile
+from profile_extractor import (
+    ProfileExtractor,
+    extract_terrain_features,
+    is_flat_terrain,
+    normalize_profile,
+)
 
 
 class SyntheticDEMLoader:
@@ -46,3 +51,12 @@ def test_is_flat_terrain_detects_low_variance() -> None:
 
     assert is_flat_terrain(flat, threshold_m=15.0) is True
     assert is_flat_terrain(rough, threshold_m=15.0) is False
+
+
+def test_extract_terrain_features_triplicates_signal_information() -> None:
+    profile = np.linspace(100.0, 160.0, 9) + np.array([0.0, 1.0, -1.0, 2.0, -2.0, 1.0, 0.0, -1.0, 1.0])
+
+    features = extract_terrain_features(profile, step_m=30.0)
+
+    assert features.shape == (profile.size * 3,)
+    assert np.isfinite(features).all()

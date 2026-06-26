@@ -157,6 +157,12 @@ class DEMLoader:
             self._patch_cache.popitem(last=False)
         return patch.copy(), transform
 
+    def get_center(self) -> tuple[float, float]:
+        """Return the geographic center of the DEM bounds as (lat, lon)."""
+
+        left, bottom, right, top = self.metadata.bounds
+        return ((bottom + top) / 2.0, (left + right) / 2.0)
+
     def get_profile_along_azimuth(
         self,
         lat: float,

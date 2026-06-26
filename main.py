@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import math
 import queue
 import signal
 import threading
@@ -17,13 +18,15 @@ from typing import Any, Iterable, List
 import numpy as np
 import pyproj
 
-from correlator import Correlator, CorrelationResult
+from correlator import Correlator, CorrelationResult, ObservabilityMetrics, compute_observability_metrics
+from constants import FIXED_BARO_ALTITUDE_M
 from dem_loader import DEMLoader
 from imm_filter import IMMFilter, IMMResult
 from nmea_parser import NMEAFrame, NMEAReader, parse_line
 from position_solver import PositionEstimate, PositionSolver
 from profile_extractor import ProfileExtractor, is_flat_terrain
 from sim_generator import SimulationConfig, TrajectoryPoint, format_gpgga, generate_points
+from sitl_bridge import SITLBridge
 from visualizer import TerrainNavigatorDash, export_flight_report
 
 
@@ -41,6 +44,9 @@ class Config:
     trajectory: int
     nmea_path: Path | None
     gt_path: Path | None
+    sitl_connection: str
+    sitl_gnss_drop_after_s: float | None
+    sitl_gnss_recover_after_s: float | None
     udp_host: str
     udp_port: int
     dashboard_host: str
@@ -51,6 +57,10 @@ class Config:
     altitude_msl_m: float
     noise_sigma: float
     window_size: int = 50
+    adaptive_window: bool = False
+    min_window_size: int = 50
+    max_window_size: int = 50
+    window_growth_step: int = 10
     step_size: int = 10
     freq_hz: float = 5.0
     dem_patch_radius_m: float = 5000.0
@@ -66,6 +76,11 @@ class FramePacket:
 
     index: int
     frame: NMEAFrame
+    gnss_available: bool = True
+    truth_lat: float | None = None
+    truth_lon: float | None = None
+    truth_heading_deg: float | None = None
+    truth_speed_mps: float | None = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +106,26 @@ class ReplayMetrics:
     azimuth_error_deg: float
 
 
+@dataclass(frozen=True)
+class NavigationDecision:
+    """Decision describing whether terrain matching is trusted for this update."""
+
+    fix: PositionEstimate
+    mode: str
+    used_prediction_only: bool
+
+
+@dataclass(frozen=True)
+class WindowSelection:
+    """Selected processing window and its diagnostics."""
+
+    frame_packets: list[FramePacket]
+    window_size: int
+    corr_result: CorrelationResult
+    observability: ObservabilityMetrics
+    flat: bool
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
     """Create the CLI parser for the main orchestrator."""
 
@@ -99,13 +134,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
     mode_group.add_argument("--sim", action="store_true", help="Simulation mode")
     mode_group.add_argument("--live", action="store_true", help="Live UDP mode")
     mode_group.add_argument("--replay", action="store_true", help="Replay NMEA log mode")
+    mode_group.add_argument("--sitl", action="store_true", help="ArduPilot SITL MAVLink mode")
 
     parser.add_argument("--dem", required=True, type=Path, help="Path to DEM GeoTIFF")
-    parser.add_argument("--lat", type=float, default=60.5, help="Initial latitude")
-    parser.add_argument("--lon", type=float, default=90.3, help="Initial longitude")
+    parser.add_argument("--lat", type=float, help="Initial latitude; defaults to DEM center when omitted")
+    parser.add_argument("--lon", type=float, help="Initial longitude; defaults to DEM center when omitted")
     parser.add_argument("--trajectory", type=int, default=1, choices=(1, 2, 3), help="Simulation trajectory id")
     parser.add_argument("--nmea", type=Path, help="Replay NMEA file path")
     parser.add_argument("--gt", type=Path, help="Ground-truth CSV file path")
+    parser.add_argument("--sitl-connect", default="udp:127.0.0.1:14550", help="MAVLink connection string for SITL")
+    parser.add_argument("--sitl-gnss-drop-after", type=float, help="Disable GNSS after N seconds in SITL mode")
+    parser.add_argument("--sitl-gnss-recover-after", type=float, help="Re-enable GNSS after N seconds in SITL mode")
     parser.add_argument("--udp-host", default="127.0.0.1", help="UDP host for live mode")
     parser.add_argument("--udp-port", type=int, default=10110, help="UDP port for live mode")
     parser.add_argument("--dashboard-host", default="127.0.0.1", help="Dashboard host")
@@ -113,9 +152,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-visualizer", action="store_true", help="Disable Dash UI")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for simulation")
     parser.add_argument("--speed", type=float, default=50.0, help="Nominal speed in m/s")
-    parser.add_argument("--altitude-msl", type=float, default=1500.0, help="Absolute altitude MSL")
     parser.add_argument("--noise", type=float, default=2.0, help="Radar-altimeter noise sigma")
     parser.add_argument("--window-size", type=int, default=50, help="Sliding window size in frames")
+    parser.add_argument("--adaptive-window", action="store_true", help="Enable adaptive window sizing")
+    parser.add_argument("--min-window-size", type=int, help="Minimum adaptive window size in frames")
+    parser.add_argument("--max-window-size", type=int, help="Maximum adaptive window size in frames")
+    parser.add_argument("--window-growth-step", type=int, help="Adaptive window increment in frames")
     parser.add_argument("--step-size", type=int, default=10, help="Sliding step in frames")
     parser.add_argument("--freq", type=float, default=5.0, help="NMEA stream frequency in Hz")
     parser.add_argument("--dem-patch-radius", type=float, default=5000.0, help="DEM patch radius in meters")
@@ -133,16 +175,32 @@ def parse_args(argv: list[str] | None = None) -> Config:
     args = parser.parse_args(argv)
     if args.replay and args.nmea is None:
         parser.error("--nmea is required in replay mode")
+    if args.window_size <= 0:
+        parser.error("--window-size must be positive")
+    if args.step_size <= 0:
+        parser.error("--step-size must be positive")
 
-    mode = "sim" if args.sim else "live" if args.live else "replay"
+    adaptive_window = bool(args.adaptive_window)
+    min_window_size = int(args.min_window_size if args.min_window_size is not None else args.window_size)
+    max_window_size = int(args.max_window_size if args.max_window_size is not None else args.window_size)
+    window_growth_step = int(args.window_growth_step if args.window_growth_step is not None else args.step_size)
+    if min_window_size <= 0 or max_window_size <= 0 or window_growth_step <= 0:
+        parser.error("Adaptive window sizes and step must be positive")
+    if min_window_size > max_window_size:
+        parser.error("--min-window-size must be <= --max-window-size")
+
+    mode = "sim" if args.sim else "live" if args.live else "replay" if args.replay else "sitl"
     return Config(
         mode=mode,
         dem_path=args.dem,
-        start_lat=args.lat,
-        start_lon=args.lon,
+        start_lat=float("nan") if args.lat is None else args.lat,
+        start_lon=float("nan") if args.lon is None else args.lon,
         trajectory=args.trajectory,
         nmea_path=args.nmea,
         gt_path=args.gt,
+        sitl_connection=args.sitl_connect,
+        sitl_gnss_drop_after_s=args.sitl_gnss_drop_after,
+        sitl_gnss_recover_after_s=args.sitl_gnss_recover_after,
         udp_host=args.udp_host,
         udp_port=args.udp_port,
         dashboard_host=args.dashboard_host,
@@ -150,9 +208,13 @@ def parse_args(argv: list[str] | None = None) -> Config:
         enable_visualizer=not args.no_visualizer,
         seed=args.seed,
         speed_mps=args.speed,
-        altitude_msl_m=args.altitude_msl,
+        altitude_msl_m=FIXED_BARO_ALTITUDE_M,
         noise_sigma=args.noise,
         window_size=args.window_size,
+        adaptive_window=adaptive_window,
+        min_window_size=min_window_size,
+        max_window_size=max_window_size,
+        window_growth_step=window_growth_step,
         step_size=args.step_size,
         freq_hz=args.freq,
         dem_patch_radius_m=args.dem_patch_radius,
@@ -258,10 +320,11 @@ def compute_replay_metrics(
 def make_simulation_points(config: Config) -> list[TrajectoryPoint]:
     """Generate simulation trajectory points from the current config."""
 
+    start_lat, start_lon = resolve_initial_coordinates(config.dem_path, config.start_lat, config.start_lon)
     sim_config = SimulationConfig(
         dem_path=config.dem_path,
-        start_lat=config.start_lat,
-        start_lon=config.start_lon,
+        start_lat=start_lat,
+        start_lon=start_lon,
         frequency_hz=config.freq_hz,
         noise_sigma_m=config.noise_sigma,
         output_mode="file",
@@ -278,6 +341,22 @@ def make_simulation_points(config: Config) -> list[TrajectoryPoint]:
         trajectory_id=config.trajectory,
     )
     return generate_points(sim_config)
+
+
+def resolve_initial_coordinates(dem_path: Path, lat: float, lon: float) -> tuple[float, float]:
+    """Resolve the initial coordinates, defaulting to the DEM center."""
+
+    if math.isfinite(lat) and math.isfinite(lon):
+        return (float(lat), float(lon))
+
+    with DEMLoader(dem_path) as dem:
+        center_lat, center_lon = dem.get_center()
+    LOGGER.info(
+        "Initial position not provided, using DEM center lat=%.6f lon=%.6f",
+        center_lat,
+        center_lon,
+    )
+    return (float(center_lat), float(center_lon))
 
 
 def build_sim_ground_truth(points: list[TrajectoryPoint]) -> list[GroundTruthPoint]:
@@ -333,7 +412,17 @@ def simulation_producer(
         frame = parse_line(format_gpgga(point.timestamp_s, point.radar_alt_measured))
         if frame is None:
             continue
-        enqueue_frame(frame_queue, FramePacket(index=point.index, frame=frame), stop_event)
+        enqueue_frame(
+            frame_queue,
+            FramePacket(
+                index=point.index,
+                frame=frame,
+                gnss_available=True,
+                truth_lat=point.lat,
+                truth_lon=point.lon,
+            ),
+            stop_event,
+        )
     return build_sim_ground_truth(points)
 
 
@@ -351,7 +440,7 @@ def replay_producer(
         for frame in reader:
             if stop_event.is_set():
                 break
-            enqueue_frame(frame_queue, FramePacket(index=valid_index, frame=frame), stop_event)
+            enqueue_frame(frame_queue, FramePacket(index=valid_index, frame=frame, gnss_available=True), stop_event)
             if frame.valid:
                 valid_index += 1
     finally:
@@ -372,13 +461,69 @@ def live_producer(
             got_frame = False
             for frame in reader:
                 got_frame = True
-                enqueue_frame(frame_queue, FramePacket(index=valid_index, frame=frame), stop_event)
+                enqueue_frame(frame_queue, FramePacket(index=valid_index, frame=frame, gnss_available=True), stop_event)
                 if frame.valid:
                     valid_index += 1
             if not got_frame:
                 time.sleep(0.05)
     finally:
         reader.close()
+
+
+def sitl_producer(
+    config: Config,
+    frame_queue: queue.Queue,
+    stop_event: threading.Event,
+    control_queue: queue.Queue | None = None,
+) -> None:
+    """Produce NMEA-compatible frames from a live ArduPilot SITL stream."""
+
+    with DEMLoader(config.dem_path) as dem:
+        bridge = SITLBridge(
+            config.sitl_connection,
+            dem,
+            gnss_drop_after_s=config.sitl_gnss_drop_after_s,
+            gnss_recover_after_s=config.sitl_gnss_recover_after_s,
+        )
+        bridge.connect()
+        try:
+            valid_index = 0
+            for sample in bridge.samples():
+                if stop_event.is_set():
+                    break
+                _drain_sitl_control_queue(bridge, control_queue)
+                frame = bridge.sample_to_nmea_frame(sample)
+                enqueue_frame(
+                    frame_queue,
+                    FramePacket(
+                        index=valid_index,
+                        frame=frame,
+                        gnss_available=bool(sample.gnss_available),
+                        truth_lat=sample.lat,
+                        truth_lon=sample.lon,
+                        truth_heading_deg=sample.heading_deg,
+                        truth_speed_mps=sample.ground_speed_mps,
+                    ),
+                    stop_event,
+                )
+                valid_index += 1
+        finally:
+            bridge.close()
+
+
+def _drain_sitl_control_queue(bridge: SITLBridge, control_queue: queue.Queue | None) -> None:
+    """Apply any pending UI commands to the live SITL bridge."""
+
+    if control_queue is None:
+        return
+    while True:
+        try:
+            command = control_queue.get_nowait()
+        except queue.Empty:
+            return
+        command_type = command.get("type")
+        if command_type == "set_gnss_enabled":
+            bridge.set_gnss_enabled(bool(command.get("enabled", True)))
 
 
 def predict_fix(
@@ -405,6 +550,186 @@ def predict_fix(
     )
 
 
+def choose_navigation_fix(
+    *,
+    config: Config,
+    corr_result: CorrelationResult,
+    solver: PositionSolver,
+    window_start_lat: float,
+    window_start_lon: float,
+    current_speed: float,
+    current_azimuth: float,
+    window_duration: float,
+    window_counter: int,
+    flat: bool,
+    observability: ObservabilityMetrics,
+) -> NavigationDecision:
+    """Select between accepted terrain fix and predictive fallback."""
+
+    if window_counter < config.cold_start_windows:
+        return NavigationDecision(
+            fix=predict_fix(
+                current_lat=window_start_lat,
+                current_lon=window_start_lon,
+                speed_mps=current_speed,
+                azimuth_deg=current_azimuth,
+                dt=window_duration,
+                confidence=corr_result.confidence,
+            ),
+            mode="cold_start_prediction",
+            used_prediction_only=True,
+        )
+
+    if flat:
+        return NavigationDecision(
+            fix=predict_fix(
+                current_lat=window_start_lat,
+                current_lon=window_start_lon,
+                speed_mps=current_speed,
+                azimuth_deg=current_azimuth,
+                dt=window_duration,
+                confidence=corr_result.confidence,
+            ),
+            mode="terrain_flat_fallback",
+            used_prediction_only=True,
+        )
+
+    if not observability.is_informative:
+        return NavigationDecision(
+            fix=predict_fix(
+                current_lat=window_start_lat,
+                current_lon=window_start_lon,
+                speed_mps=current_speed,
+                azimuth_deg=current_azimuth,
+                dt=window_duration,
+                confidence=corr_result.confidence,
+            ),
+            mode="terrain_uninformative_fallback",
+            used_prediction_only=True,
+        )
+
+    if corr_result.is_ambiguous:
+        return NavigationDecision(
+            fix=predict_fix(
+                current_lat=window_start_lat,
+                current_lon=window_start_lon,
+                speed_mps=current_speed,
+                azimuth_deg=current_azimuth,
+                dt=window_duration,
+                confidence=corr_result.confidence,
+            ),
+            mode="terrain_ambiguous_fallback",
+            used_prediction_only=True,
+        )
+
+    if not corr_result.is_reliable:
+        return NavigationDecision(
+            fix=predict_fix(
+                current_lat=window_start_lat,
+                current_lon=window_start_lon,
+                speed_mps=current_speed,
+                azimuth_deg=current_azimuth,
+                dt=window_duration,
+                confidence=corr_result.confidence,
+            ),
+            mode="terrain_low_confidence_fallback",
+            used_prediction_only=True,
+        )
+
+    return NavigationDecision(
+        fix=solver.solve(
+            result=corr_result,
+            start_lat=window_start_lat,
+            start_lon=window_start_lon,
+            window_duration_s=window_duration,
+        ),
+        mode="terrain_update_accepted",
+        used_prediction_only=False,
+    )
+
+
+def build_window_sizes(config: Config, available_frames: int) -> list[int]:
+    """Return candidate window sizes for the current buffer length."""
+
+    if available_frames <= 0:
+        return []
+
+    if not config.adaptive_window:
+        return [config.window_size] if available_frames >= config.window_size else []
+
+    start = max(config.min_window_size, 1)
+    stop = min(config.max_window_size, available_frames)
+    sizes = list(range(start, stop + 1, config.window_growth_step))
+    if not sizes or sizes[-1] != stop:
+        sizes.append(stop)
+    return sorted({size for size in sizes if size <= available_frames})
+
+
+def select_processing_window(
+    *,
+    config: Config,
+    buffer: deque[FramePacket],
+    correlator: Correlator,
+    ref_matrix: np.ndarray,
+    measurement_step_m: float,
+) -> WindowSelection | None:
+    """Select a fixed or adaptive processing window based on observability and ambiguity."""
+
+    candidate_sizes = build_window_sizes(config, len(buffer))
+    if not candidate_sizes:
+        return None
+
+    evaluations: list[WindowSelection] = []
+    azimuth_axis = np.arange(0.0, ref_matrix.shape[0], 1.0)
+    for candidate_size in candidate_sizes:
+        frame_packets = list(buffer)[-candidate_size:]
+        h_meas = np.array(
+            [config.altitude_msl_m - item.frame.radar_alt_m for item in frame_packets],
+            dtype=float,
+        )
+        flat = is_flat_terrain(h_meas, threshold_m=config.flat_terrain_threshold_m)
+        corr_result = correlator.compute(
+            h_meas=h_meas,
+            ref_matrix=ref_matrix,
+            azimuths_deg=azimuth_axis,
+        )
+        observability = compute_observability_metrics(
+            corr_result.best_reference_profile,
+            sigma_noise_m=max(config.noise_sigma, 1e-3),
+            step_m=measurement_step_m,
+        )
+        evaluations.append(
+            WindowSelection(
+                frame_packets=frame_packets,
+                window_size=candidate_size,
+                corr_result=corr_result,
+                observability=observability,
+                flat=flat,
+            )
+        )
+
+        if (
+            config.adaptive_window
+            and observability.is_informative
+            and corr_result.is_reliable
+            and not corr_result.is_ambiguous
+            and not flat
+        ):
+            return evaluations[-1]
+
+    def _score(item: WindowSelection) -> tuple[float, float, float]:
+        informative_bonus = 1.0 if item.observability.is_informative else 0.0
+        reliability_bonus = 1.0 if item.corr_result.is_reliable else 0.0
+        ambiguity_penalty = 1.0 if item.corr_result.is_ambiguous else 0.0
+        flat_penalty = 1.0 if item.flat else 0.0
+        primary = informative_bonus * 3.0 + reliability_bonus * 2.0 - ambiguity_penalty - flat_penalty
+        secondary = item.corr_result.peak_correlation + item.corr_result.confidence + item.observability.efficiency_hint
+        tertiary = -float(item.window_size)
+        return (primary, secondary, tertiary)
+
+    return max(evaluations, key=_score)
+
+
 def pipeline_worker(
     config: Config,
     frame_queue: queue.Queue,
@@ -417,16 +742,20 @@ def pipeline_worker(
 
     geod = pyproj.Geod(ellps="WGS84")
     history: list[tuple[int, IMMResult]] = []
-    buffer: deque[FramePacket] = deque(maxlen=config.window_size)
-    window_start_lat = config.start_lat
-    window_start_lon = config.start_lon
+    buffer_capacity = config.max_window_size if config.adaptive_window else config.window_size
+    buffer: deque[FramePacket] = deque(maxlen=buffer_capacity)
+    window_start_lat, window_start_lon = resolve_initial_coordinates(
+        config.dem_path,
+        config.start_lat,
+        config.start_lon,
+    )
     current_azimuth = 45.0
     current_speed = config.speed_mps
     step_dt = config.step_size / config.freq_hz
-    window_duration = config.window_size / config.freq_hz
+    default_window_duration = config.window_size / config.freq_hz
     window_counter = 0
     measurement_step_m = config.speed_mps / config.freq_hz
-    measured_profile_length_m = config.window_size * measurement_step_m
+    measured_profile_length_m = config.max_window_size * measurement_step_m if config.adaptive_window else config.window_size * measurement_step_m
     reference_profile_length_m = measured_profile_length_m + config.max_offset_m
 
     with DEMLoader(config.dem_path) as dem:
@@ -452,39 +781,47 @@ def pipeline_worker(
                 continue
 
             buffer.append(packet)
-            if len(buffer) < config.window_size:
+            minimum_frames = config.min_window_size if config.adaptive_window else config.window_size
+            if len(buffer) < minimum_frames:
                 continue
 
-            frames_window = [item.frame for item in buffer]
-            center_frame_index = buffer[-1].index
+            ref_matrix = extractor.build_reference_matrix(window_start_lat, window_start_lon)
+            selection = select_processing_window(
+                config=config,
+                buffer=buffer,
+                correlator=correlator,
+                ref_matrix=ref_matrix,
+                measurement_step_m=measurement_step_m,
+            )
+            if selection is None:
+                continue
+
+            frames_window = [item.frame for item in selection.frame_packets]
+            center_frame_index = selection.frame_packets[-1].index
+            latest_packet = selection.frame_packets[-1]
             h_meas = np.array(
                 [config.altitude_msl_m - frame.radar_alt_m for frame in frames_window],
                 dtype=float,
             )
-            flat = is_flat_terrain(h_meas, threshold_m=config.flat_terrain_threshold_m)
-            ref_matrix = extractor.build_reference_matrix(window_start_lat, window_start_lon)
-            corr_result = correlator.compute(
-                h_meas=h_meas,
-                ref_matrix=ref_matrix,
-                azimuths_deg=np.arange(0.0, ref_matrix.shape[0], 1.0),
-            )
+            flat = selection.flat
+            corr_result = selection.corr_result
+            observability = selection.observability
+            window_duration = selection.window_size / config.freq_hz
 
-            if window_counter < config.cold_start_windows:
-                position_fix = predict_fix(
-                    current_lat=window_start_lat,
-                    current_lon=window_start_lon,
-                    speed_mps=current_speed,
-                    azimuth_deg=current_azimuth,
-                    dt=window_duration,
-                    confidence=corr_result.confidence,
-                )
-            else:
-                position_fix = solver.solve(
-                    result=corr_result,
-                    start_lat=window_start_lat,
-                    start_lon=window_start_lon,
-                    window_duration_s=window_duration,
-                )
+            nav_decision = choose_navigation_fix(
+                config=config,
+                corr_result=corr_result,
+                solver=solver,
+                window_start_lat=window_start_lat,
+                window_start_lon=window_start_lon,
+                current_speed=current_speed,
+                current_azimuth=current_azimuth,
+                window_duration=window_duration,
+                window_counter=window_counter,
+                flat=flat,
+                observability=observability,
+            )
+            position_fix = nav_decision.fix
 
             imm_result = imm.update(position_fix, dt=step_dt, is_flat=flat)
             current_azimuth = imm_result.azimuth_deg
@@ -501,6 +838,26 @@ def pipeline_worker(
                     "ref": corr_result.best_reference_profile,
                     "dem_patch": dem_patch,
                     "hdop": imm.get_hdop(),
+                    "nav_mode": nav_decision.mode,
+                    "used_prediction_only": nav_decision.used_prediction_only,
+                    "selected_window_size": selection.window_size,
+                    "gnss_available": latest_packet.gnss_available,
+                    "truth": (
+                        {
+                            "lat": latest_packet.truth_lat,
+                            "lon": latest_packet.truth_lon,
+                            "heading_deg": latest_packet.truth_heading_deg,
+                            "speed_mps": latest_packet.truth_speed_mps,
+                        }
+                        if latest_packet.truth_lat is not None and latest_packet.truth_lon is not None
+                        else None
+                    ),
+                    "observability": {
+                        "crlb_m": observability.crlb_m,
+                        "gradient_energy": observability.gradient_energy,
+                        "efficiency_hint": observability.efficiency_hint,
+                        "is_informative": observability.is_informative,
+                    },
                 },
                 stop_event,
             )
@@ -540,6 +897,7 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
 
     frame_queue: queue.Queue = queue.Queue(maxsize=1000)
     state_queue: queue.Queue = queue.Queue(maxsize=100)
+    control_queue: queue.Queue = queue.Queue(maxsize=10)
     stop_event = threading.Event()
     producer_done_event = threading.Event()
     pipeline_done_event = threading.Event()
@@ -559,6 +917,8 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
                 simulation_producer(config, frame_queue, stop_event)
             elif config.mode == "replay":
                 replay_producer(config, frame_queue, stop_event)
+            elif config.mode == "sitl":
+                sitl_producer(config, frame_queue, stop_event, control_queue=control_queue)
             else:
                 live_producer(config, frame_queue, stop_event)
         finally:
@@ -583,7 +943,7 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
     dashboard_history: list[IMMResult] = []
     dashboard_thread: threading.Thread | None = None
     if config.enable_visualizer:
-        dashboard = TerrainNavigatorDash(state_queue=state_queue)
+        dashboard = TerrainNavigatorDash(state_queue=state_queue, control_queue=control_queue)
 
         def dashboard_target() -> None:
             dashboard.run(host=config.dashboard_host, port=config.dashboard_port, debug=False)

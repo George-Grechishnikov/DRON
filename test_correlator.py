@@ -4,7 +4,7 @@ import time
 
 import numpy as np
 
-from correlator import Correlator, build_heatmap
+from correlator import Correlator, build_heatmap, compute_crlb_position, compute_observability_metrics
 from nmea_parser import NMEAFrame
 
 
@@ -41,6 +41,7 @@ def test_compute_recovers_best_azimuth_and_offset() -> None:
     assert result.best_azimuth_deg == 45.0
     assert result.best_offset_steps == 10
     assert result.best_offset_m == 300.0
+    assert abs(result.best_offset_subsample_steps - 10.0) < 1.0
     assert result.peak_correlation > 0.95
     assert result.best_reference_profile.shape == h_meas.shape
 
@@ -94,3 +95,69 @@ def test_compute_performance_under_half_second() -> None:
 
     assert result.best_azimuth_deg == 120.0
     assert elapsed < 0.5
+
+
+def test_compute_returns_ambiguity_metrics() -> None:
+    azimuths = np.arange(8, dtype=float)
+    ref_matrix = _make_reference_matrix(8, 40, 8)
+    h_meas = ref_matrix[3, 4:44]
+    correlator = Correlator(profile_length_m=1200.0, step_m=30.0, max_offset_m=240.0)
+
+    result = correlator.compute(h_meas, ref_matrix, azimuths_deg=azimuths)
+
+    assert np.isfinite(result.pslr_db)
+    assert result.ambiguity_peak_count >= 1
+    assert result.peak_isolation_m >= 0.0
+    assert isinstance(result.is_ambiguous, bool)
+
+
+def test_compute_supports_feature_mode() -> None:
+    azimuths = np.arange(24, dtype=float)
+    ref_matrix = _make_reference_matrix(24, 48, 10)
+    h_meas = ref_matrix[9, 5:53]
+    correlator = Correlator(
+        profile_length_m=1440.0,
+        step_m=30.0,
+        max_offset_m=300.0,
+        use_terrain_features=True,
+    )
+
+    result = correlator.compute(h_meas, ref_matrix, azimuths_deg=azimuths)
+
+    assert result.best_azimuth_deg == 9.0
+    assert result.best_offset_steps == 5
+
+
+def test_compute_supports_top_k_feature_refinement() -> None:
+    azimuths = np.arange(32, dtype=float)
+    ref_matrix = _make_reference_matrix(32, 64, 12)
+    h_meas = ref_matrix[11, 6:70]
+    correlator = Correlator(
+        profile_length_m=1920.0,
+        step_m=30.0,
+        max_offset_m=360.0,
+        feature_refine_top_k=5,
+    )
+
+    result = correlator.compute(h_meas, ref_matrix, azimuths_deg=azimuths)
+
+    assert result.best_azimuth_deg == 11.0
+    assert result.best_offset_steps == 6
+
+
+def test_compute_crlb_position_is_finite_for_informative_profile() -> None:
+    profile = np.array([100.0, 120.0, 90.0, 140.0, 80.0, 130.0], dtype=float)
+
+    crlb_m = compute_crlb_position(profile, sigma_noise_m=3.0, step_m=30.0)
+
+    assert np.isfinite(crlb_m)
+    assert crlb_m > 0.0
+
+
+def test_compute_observability_metrics_detects_flat_profile() -> None:
+    profile = np.full((10,), 100.0, dtype=float)
+
+    metrics = compute_observability_metrics(profile, sigma_noise_m=3.0, step_m=30.0)
+
+    assert metrics.is_informative is False
+    assert np.isinf(metrics.crlb_m)

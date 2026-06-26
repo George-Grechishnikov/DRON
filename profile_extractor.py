@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from pyproj import Geod
+from scipy.signal import savgol_filter
 
 from dem_loader import DEMLoader
 
@@ -38,6 +39,40 @@ def is_flat_terrain(profile: np.ndarray, threshold_m: float = 15.0) -> bool:
     if values.size == 0:
         return True
     return float(np.nanstd(values)) < threshold_m
+
+
+def _smooth_profile(values: np.ndarray, window_length: int = 5) -> np.ndarray:
+    """Smooth a profile before derivative estimation."""
+
+    profile = np.asarray(values, dtype=float)
+    if profile.size < 5:
+        return profile.copy()
+
+    candidate = min(window_length, profile.size if profile.size % 2 == 1 else profile.size - 1)
+    if candidate < 5:
+        return profile.copy()
+    return savgol_filter(profile, window_length=candidate, polyorder=2, mode="interp")
+
+
+def extract_terrain_features(profile: np.ndarray, step_m: float = 30.0) -> np.ndarray:
+    """Build a normalized terrain feature vector from height, slope, and curvature."""
+
+    values = np.asarray(profile, dtype=float)
+    if values.ndim != 1:
+        raise ValueError("profile must be a 1D array")
+    if step_m <= 0:
+        raise ValueError("step_m must be positive")
+    if values.size == 0:
+        return np.empty((0,), dtype=float)
+
+    smoothed = _smooth_profile(values)
+    slope = np.gradient(smoothed, step_m)
+    curvature = np.gradient(slope, step_m)
+
+    height_norm = normalize_profile(smoothed) * 0.5
+    slope_norm = normalize_profile(slope) * 0.3
+    curvature_norm = normalize_profile(curvature) * 0.2
+    return np.concatenate([height_norm, slope_norm, curvature_norm]).astype(float, copy=False)
 
 
 @dataclass(frozen=True)

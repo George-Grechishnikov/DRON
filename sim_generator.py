@@ -26,6 +26,7 @@ from typing import Iterable, Iterator, Sequence
 
 import numpy as np
 import rasterio
+from constants import FIXED_BARO_ALTITUDE_M
 from pyproj import Geod
 from rasterio.transform import Affine
 
@@ -380,7 +381,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trajectory", type=int, choices=(1, 2, 3), help="Preset trajectory id")
     parser.add_argument("--azimuth", type=float, default=45.0, help="Custom route azimuth in degrees")
     parser.add_argument("--speed", type=float, default=50.0, help="Vehicle speed in m/s")
-    parser.add_argument("--altitude-msl", type=float, default=1500.0, help="Absolute altitude MSL in meters")
     parser.add_argument("--duration-s", type=float, help="Custom route duration in seconds")
     parser.add_argument("--length-km", type=float, help="Custom route length in kilometers")
     parser.add_argument("--freq", type=float, default=5.0, help="NMEA output frequency in Hz")
@@ -420,7 +420,7 @@ def parse_args(argv: Sequence[str] | None = None) -> SimulationConfig:
         udp_host=args.udp_host,
         udp_port=args.udp_port,
         random_seed=args.seed,
-        altitude_msl_m=args.altitude_msl,
+        altitude_msl_m=FIXED_BARO_ALTITUDE_M,
         speed_mps=args.speed,
         azimuth_deg=args.azimuth,
         duration_s=args.duration_s,

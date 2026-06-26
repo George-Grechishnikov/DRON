@@ -38,11 +38,12 @@
 - `pytest`
 - `dash`
 - `plotly`
+- `pymavlink` for `ArduPilot SITL` bridge
 
 Установка зависимостей:
 
 ```powershell
-python -m pip install --user numpy rasterio pyproj scipy pytest dash plotly
+python -m pip install --user numpy rasterio pyproj scipy pytest dash plotly pymavlink
 ```
 
 ## Структура проекта
@@ -57,6 +58,7 @@ DRON/
   position_solver.py
   imm_filter.py
   visualizer.py
+  sitl_bridge.py
   main.py
   test_sim_generator.py
   test_nmea_parser.py
@@ -66,9 +68,136 @@ DRON/
   test_position_solver.py
   test_imm_filter.py
   test_visualizer.py
+  test_sitl_bridge.py
   integration_test.py
   test_main.py
 ```
+
+## Case-aligned input path
+
+The competition case requires:
+
+- radar-altimeter data in `NMEA-0183 v3`
+- message type compatible with `GPGGA`
+- altitude value in meters in the GGA altitude field
+- barometric altitude fixed at `1500 m`
+- message frequency in the `1-10 Hz` range
+
+The project now follows that contract directly:
+
+- the core algorithm consumes only parsed `NMEAFrame` radar-altimeter samples
+- the terrain profile is reconstructed as `terrain_height_m = 1500.0 - radar_alt_m`
+- `--live` mode is the most case-faithful runtime path because it reads `NMEA GPGGA` from UDP
+- if `--lat` and `--lon` are omitted, the initial search point defaults to the center of the DEM, which matches the case wording about starting from the map center
+
+Recommended strict demo path:
+
+1. Use `sitl_bridge.py` to synthesize radar-altimeter `GPGGA` messages from the simulator.
+2. Stream those messages over UDP at `1-10 Hz`.
+3. Run `main.py --live` so the navigation pipeline receives only `NMEA` input.
+
+Example strict-case pipeline:
+
+```powershell
+python .\sitl_bridge.py --dem .\data\fabdem_canberra.tif --connect udp:127.0.0.1:14550 --stream-nmea-udp --udp-host 127.0.0.1 --udp-port 10110 --stream-rate-hz 5 --count 0
+```
+
+In another terminal:
+
+```powershell
+python .\main.py --live --dem .\data\fabdem_canberra.tif --udp-host 127.0.0.1 --udp-port 10110
+```
+
+## SITL bridge
+
+`sitl_bridge.py` is the dedicated bridge layer for `ArduPilot SITL`.
+
+It is responsible for:
+- connecting to SITL over `MAVLink`
+- reading telemetry from `GLOBAL_POSITION_INT` and related messages
+- deriving a unified sample stream:
+  - `timestamp`
+  - `lat`
+  - `lon`
+  - `alt_msl`
+  - `heading_deg`
+  - `ground_speed_mps`
+  - `radar_alt_m`
+  - `gnss_available`
+- emulating `GNSS ON/OFF` by timer
+- converting samples back into `GPGGA`-compatible radar-altimeter NMEA for pipeline compatibility
+- optional streaming of synthesized `GPGGA` messages over UDP for strict case-aligned testing
+
+This keeps the existing terrain-navigation pipeline intact while we add SITL integration step by step.
+
+Recent navigation hardening:
+
+- FFT-backed normalized cross-correlation for the fast path
+- ambiguity metrics (`PSLR`, peak count, peak isolation)
+- sub-step offset interpolation
+- predictive fallback when terrain update is flat, ambiguous, or low-confidence
+- optional top-k terrain-feature refinement for stronger candidates
+
+Quick smoke test after SITL is running:
+
+```powershell
+python .\sitl_bridge.py --dem .\data\dem.tif --connect udp:127.0.0.1:14550 --count 5
+```
+
+To force the bridge into demo mode with GNSS unavailable:
+
+```powershell
+python .\sitl_bridge.py --dem .\data\dem.tif --connect udp:127.0.0.1:14550 --count 5 --gnss-off
+```
+
+Full pipeline SITL mode:
+
+```powershell
+python .\main.py --sitl --dem .\data\dem.tif --sitl-connect udp:127.0.0.1:14550 --lat 60.5 --lon 90.3
+```
+
+SITL mode with demo GNSS loss:
+
+```powershell
+python .\main.py --sitl --dem .\data\dem.tif --sitl-connect udp:127.0.0.1:14550 --sitl-gnss-drop-after 20 --lat 60.5 --lon 90.3
+```
+
+In `--sitl` mode the dashboard now shows:
+
+- live `GNSS AVAILABLE / GNSS LOST` state
+- estimated trajectory from the TERRAIN NAVIGATOR pipeline
+- truth position from SITL when available
+- adaptive window size, PSLR, CRLB-like observability, and terrain fallback mode
+
+Manual GNSS control for live demo:
+
+- start the full `--sitl` pipeline command
+- open the Dash dashboard in the browser
+- use the `GNSS ON` and `GNSS OFF` buttons in the control panel
+- the command is delivered into the SITL bridge immediately through the internal control queue
+- after `GNSS OFF`, the pipeline continues in terrain-navigation / prediction-assisted mode
+- after `GNSS ON`, the demo can show recovery of satellite availability and comparison against SITL truth again
+
+Recommended jury demo flow:
+
+1. Start with `GNSS ON` and show that truth telemetry is visible.
+2. Press `GNSS OFF` during motion and point to the live `GNSS LOST` status.
+3. Show that the estimated trajectory and terrain correlation diagnostics continue updating.
+4. Press `GNSS ON` again and show reappearance of GNSS-assisted comparison against SITL truth.
+
+Correlation benchmark for desktop / Jetson / Raspberry Pi:
+
+```powershell
+python .\benchmark_correlator.py --iterations 20
+```
+
+Current MVP limitations and honest claims:
+
+- validated well on synthetic and local integration scenarios, not yet on flight-grade real datasets
+- current SITL integration is intended for GNSS-loss continuation demos, not full cold-start navigation
+- best performance is expected on terrain with informative relief; flat terrain correctly triggers fallback more often
+- offline DEM coverage still assumes mission-region data is preloaded before launch
+- cost, Arctic universality, and final field accuracy should be presented as hypotheses or next-stage validation items, not as proven production claims
 
 ## Что уже умеет проект
 
@@ -287,6 +416,7 @@ dashboard.run(host="127.0.0.1", port=8050, debug=False)
 - запускать проект в режимах `sim`, `live`, `replay`
 - поднимать producer/pipeline/dashboard потоки
 - крутить скользящее окно обработки
+- при включении adaptive mode подбирать размер окна между `min_window_size` и `max_window_size`
 - собирать состояние для `visualizer.py`
 - считать replay-метрики по `ground truth`
 - экспортировать HTML-отчёт по завершении
@@ -295,6 +425,10 @@ dashboard.run(host="127.0.0.1", port=8050, debug=False)
 
 ```powershell
 python .\main.py --sim --dem .\data\dem.tif --trajectory 1 --lat 60.5 --lon 90.3
+```
+
+```powershell
+python .\main.py --sim --dem .\data\dem.tif --trajectory 1 --adaptive-window --min-window-size 20 --max-window-size 50 --window-growth-step 10
 ```
 
 ```powershell
@@ -359,6 +493,11 @@ python -m pytest .\integration_test.py -q
 7. `imm_filter.py` сглаживает решение по режимам движения
 8. `visualizer.py` показывает текущее состояние и историю
 9. `main.py` связывает всё в один рабочий pipeline
+
+Дополнительная логика устойчивости:
+- `correlator.py` считает `PSLR`, ambiguity и sub-step offset
+- `main.py` считает CRLB-like observability и может уйти в predictive fallback
+- adaptive window выбирает минимальное окно, которое уже даёт достаточно информативный terrain signal
 
 ## Что осталось дальше
 

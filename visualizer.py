@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import math
 import queue
-from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
-import dash
 from dash import Dash, Input, Output, State, dcc, html, no_update
 import numpy as np
 import plotly.graph_objects as go
@@ -61,7 +59,7 @@ def create_arrow_shape(lat: float, lon: float, azimuth: float, length_deg: float
     ]
 
 
-def export_flight_report(history: List[IMMResult], path: str) -> None:
+def export_flight_report(history: list[IMMResult], path: str) -> None:
     """Export a lightweight HTML report with the fused trajectory."""
 
     figure = go.Figure()
@@ -88,8 +86,9 @@ def export_flight_report(history: List[IMMResult], path: str) -> None:
 class TerrainNavigatorDash:
     """Real-time Plotly Dash dashboard for TERRAIN NAVIGATOR state updates."""
 
-    def __init__(self, state_queue: queue.Queue) -> None:
+    def __init__(self, state_queue: queue.Queue, control_queue: queue.Queue | None = None) -> None:
         self.state_queue = state_queue
+        self.control_queue = control_queue
         self.app = Dash(__name__)
         self.app.layout = html.Div(
             style={
@@ -101,6 +100,23 @@ class TerrainNavigatorDash:
             },
             children=[
                 html.H1("TERRAIN NAVIGATOR", style={"marginBottom": "12px"}),
+                html.Div(
+                    style={"display": "flex", "gap": "10px", "marginBottom": "12px"},
+                    children=[
+                        html.Button(
+                            "GNSS ON",
+                            id="gnss-on-button",
+                            n_clicks=0,
+                            style={"padding": "10px 14px", "backgroundColor": "#27ae60", "color": "#ffffff", "border": "none"},
+                        ),
+                        html.Button(
+                            "GNSS OFF",
+                            id="gnss-off-button",
+                            n_clicks=0,
+                            style={"padding": "10px 14px", "backgroundColor": "#c0392b", "color": "#ffffff", "border": "none"},
+                        ),
+                    ],
+                ),
                 dcc.Store(id="history-store", data={"history": []}),
                 dcc.Interval(id="dashboard-interval", interval=500, n_intervals=0),
                 html.Div(
@@ -128,6 +144,16 @@ class TerrainNavigatorDash:
 
     def _register_callbacks(self) -> None:
         @self.app.callback(
+            Output("gnss-on-button", "title"),
+            Input("gnss-on-button", "n_clicks"),
+            Input("gnss-off-button", "n_clicks"),
+            prevent_initial_call=True,
+        )
+        def _control_callback(gnss_on_clicks: int, gnss_off_clicks: int) -> str:
+            del gnss_on_clicks, gnss_off_clicks
+            return self.handle_gnss_button_click()
+
+        @self.app.callback(
             Output("correlation-heatmap", "figure"),
             Output("terrain-map", "figure"),
             Output("profiles-graph", "figure"),
@@ -138,6 +164,40 @@ class TerrainNavigatorDash:
         )
         def _callback(n_intervals: int, data_store: dict[str, Any]) -> tuple[Any, Any, Any, Any, Any]:
             return self.update_all_panels(n_intervals, data_store)
+
+    def handle_gnss_button_click(self) -> str:
+        """Handle a GNSS control button event by pushing a command to the control queue."""
+
+        if self.control_queue is None:
+            return "GNSS control unavailable"
+
+        from dash import callback_context
+
+        triggered = callback_context.triggered
+        if not triggered:
+            return "GNSS control idle"
+        prop_id = triggered[0]["prop_id"].split(".", 1)[0]
+        command = None
+        if prop_id == "gnss-on-button":
+            command = {"type": "set_gnss_enabled", "enabled": True}
+        elif prop_id == "gnss-off-button":
+            command = {"type": "set_gnss_enabled", "enabled": False}
+        if command is None:
+            return "GNSS control ignored"
+        self.send_control_command(command)
+        return f"Queued {prop_id}"
+
+    def send_control_command(self, command: dict[str, Any]) -> None:
+        """Send a control command to the producer side."""
+
+        try:
+            self.control_queue.put_nowait(command)
+        except queue.Full:
+            try:
+                self.control_queue.get_nowait()
+            except queue.Empty:
+                pass
+            self.control_queue.put_nowait(command)
 
     def update_all_panels(
         self,
@@ -175,9 +235,7 @@ class TerrainNavigatorDash:
     def _build_correlation_figure(self, corr: CorrelationResult) -> go.Figure:
         heatmap = build_heatmap(corr)
         x_offsets = np.arange(heatmap.shape[1], dtype=float) * (
-            corr.best_offset_m / max(corr.best_offset_steps, 1)
-            if corr.best_offset_steps > 0
-            else 30.0
+            corr.best_offset_m / max(corr.best_offset_steps, 1) if corr.best_offset_steps > 0 else 30.0
         )
         figure = go.Figure(
             data=[
@@ -199,9 +257,9 @@ class TerrainNavigatorDash:
         )
         figure.update_layout(
             template="plotly_dark",
-            title=f"Корреляция r(theta, s) | Макс: {corr.peak_correlation:.3f} @ {corr.best_azimuth_deg:.0f}°",
-            xaxis_title="Смещение, м",
-            yaxis_title="Азимут, град",
+            title=f"Correlation Heatmap | peak={corr.peak_correlation:.3f} @ {corr.best_azimuth_deg:.0f} deg",
+            xaxis_title="Offset, m",
+            yaxis_title="Azimuth, deg",
             margin={"l": 40, "r": 20, "t": 60, "b": 40},
         )
         return figure
@@ -209,6 +267,7 @@ class TerrainNavigatorDash:
     def _build_map_figure(self, state: dict[str, Any], history: list[dict[str, Any]]) -> go.Figure:
         patch = np.asarray(state.get("dem_patch", np.zeros((2, 2), dtype=float)), dtype=float)
         fix: IMMResult = state["fix"]
+        truth = state.get("truth")
         figure = go.Figure()
         figure.add_trace(
             go.Heatmap(
@@ -238,9 +297,19 @@ class TerrainNavigatorDash:
                 name="Current position",
             )
         )
+        if truth is not None:
+            figure.add_trace(
+                go.Scatter(
+                    x=[truth["lon"]],
+                    y=[truth["lat"]],
+                    mode="markers",
+                    marker={"color": "#27ae60", "size": 10, "symbol": "diamond"},
+                    name="Truth position",
+                )
+            )
         figure.update_layout(
             template="plotly_dark",
-            title="Карта высот и траектория",
+            title="Terrain Map and Trajectory",
             xaxis_title="Longitude",
             yaxis_title="Latitude",
             margin={"l": 40, "r": 20, "t": 60, "b": 40},
@@ -274,9 +343,9 @@ class TerrainNavigatorDash:
         )
         figure.update_layout(
             template="plotly_dark",
-            title="Профили высот",
-            xaxis_title="Расстояние, м",
-            yaxis_title="Высота, м",
+            title="Terrain Profiles",
+            xaxis_title="Distance, m",
+            yaxis_title="Elevation, m",
             annotations=[
                 {
                     "x": 0.98,
@@ -294,7 +363,20 @@ class TerrainNavigatorDash:
 
     def _build_telemetry_figure(self, state: dict[str, Any]) -> go.Figure:
         fix: IMMResult = state["fix"]
+        corr: CorrelationResult = state["corr"]
         hdop = float(state.get("hdop", math.sqrt(max(np.trace(fix.covariance[0:2, 0:2]), 0.0))))
+        nav_mode = str(state.get("nav_mode", "unknown"))
+        used_prediction_only = bool(state.get("used_prediction_only", False))
+        selected_window_size = int(state.get("selected_window_size", 0))
+        gnss_available = bool(state.get("gnss_available", True))
+        observability = dict(state.get("observability", {}))
+        crlb_m = float(observability.get("crlb_m", float("inf")))
+        terrain_informative = bool(observability.get("is_informative", False))
+        terrain_status = "FALLBACK / PREDICT" if used_prediction_only else "TERRAIN UPDATE"
+        terrain_color = "#f39c12" if used_prediction_only else "#27ae60"
+        gnss_status = "GNSS AVAILABLE" if gnss_available else "GNSS LOST"
+        gnss_color = "#27ae60" if gnss_available else "#c0392b"
+
         figure = go.Figure()
         figure.add_trace(
             go.Bar(
@@ -309,7 +391,7 @@ class TerrainNavigatorDash:
                 mode="gauge+number",
                 value=float(fix.speed_mps),
                 domain={"x": [0.60, 0.98], "y": [0.45, 0.98]},
-                title={"text": "Скорость, м/с"},
+                title={"text": "Speed, m/s"},
                 gauge={
                     "axis": {"range": [0, 100]},
                     "bar": {"color": "#ff6b6b"},
@@ -319,7 +401,7 @@ class TerrainNavigatorDash:
         )
         figure.update_layout(
             template="plotly_dark",
-            title="Телеметрия IMM",
+            title="IMM Telemetry",
             margin={"l": 40, "r": 20, "t": 60, "b": 40},
             annotations=[
                 {
@@ -332,12 +414,47 @@ class TerrainNavigatorDash:
                     "text": (
                         f"Lat: {fix.lat:.6f}<br>"
                         f"Lon: {fix.lon:.6f}<br>"
-                        f"Azimuth: {fix.azimuth_deg:.1f}°<br>"
+                        f"Azimuth: {fix.azimuth_deg:.1f} deg<br>"
                         f"Mode: {fix.dominant_mode}<br>"
-                        f"HDOP: {hdop:.1f} m"
+                        f"HDOP: {hdop:.1f} m<br>"
+                        f"Nav mode: {nav_mode}<br>"
+                        f"Window size: {selected_window_size} frames<br>"
+                        f"GNSS: {gnss_status}<br>"
+                        f"PSLR: {corr.pslr_db:.2f} dB<br>"
+                        f"Ambiguous: {corr.is_ambiguous}<br>"
+                        f"CRLB: {crlb_m:.1f} m<br>"
+                        f"Terrain informative: {terrain_informative}"
                     ),
                     "font": {"size": 13},
-                }
+                },
+                {
+                    "xref": "paper",
+                    "yref": "paper",
+                    "x": 0.79,
+                    "y": 0.24,
+                    "showarrow": False,
+                    "align": "center",
+                    "text": terrain_status,
+                    "font": {"size": 14, "color": "#f4f7fb"},
+                    "bgcolor": terrain_color,
+                    "bordercolor": "#f4f7fb",
+                    "borderwidth": 1,
+                    "borderpad": 6,
+                },
+                {
+                    "xref": "paper",
+                    "yref": "paper",
+                    "x": 0.79,
+                    "y": 0.10,
+                    "showarrow": False,
+                    "align": "center",
+                    "text": gnss_status,
+                    "font": {"size": 14, "color": "#f4f7fb"},
+                    "bgcolor": gnss_color,
+                    "bordercolor": "#f4f7fb",
+                    "borderwidth": 1,
+                    "borderpad": 6,
+                },
             ],
         )
         return figure

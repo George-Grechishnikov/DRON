@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 output/
 terrain_navigator.log
+data/fabdem_cache/
