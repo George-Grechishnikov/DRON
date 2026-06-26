@@ -11,6 +11,7 @@
 - `position_solver.py` — преобразование корреляционного результата в геодезический fix
 - `imm_filter.py` — сглаживание решения через режимы hover/cruise/turn
 - `visualizer.py` — Plotly Dash дашборд реального времени
+- `main.py` — главный оркестратор pipeline
 
 Этот `README` будем постепенно дополнять по мере реализации следующих задач.
 
@@ -56,6 +57,7 @@ DRON/
   position_solver.py
   imm_filter.py
   visualizer.py
+  main.py
   test_sim_generator.py
   test_nmea_parser.py
   test_dem_loader.py
@@ -64,6 +66,7 @@ DRON/
   test_position_solver.py
   test_imm_filter.py
   test_visualizer.py
+  test_main.py
 ```
 
 ## Что уже умеет проект
@@ -277,6 +280,36 @@ dashboard = TerrainNavigatorDash(state_queue=state_queue)
 dashboard.run(host="127.0.0.1", port=8050, debug=False)
 ```
 
+### 9. Главный оркестратор
+
+`main.py` умеет:
+- запускать проект в режимах `sim`, `live`, `replay`
+- поднимать producer/pipeline/dashboard потоки
+- крутить скользящее окно обработки
+- собирать состояние для `visualizer.py`
+- считать replay-метрики по `ground truth`
+- экспортировать HTML-отчёт по завершении
+
+Примеры запуска:
+
+```powershell
+python .\main.py --sim --dem .\data\dem.tif --trajectory 1 --lat 60.5 --lon 90.3
+```
+
+```powershell
+python .\main.py --live --dem .\data\dem.tif --udp-host 127.0.0.1 --udp-port 10110 --lat 60.5 --lon 90.3
+```
+
+```powershell
+python .\main.py --replay --dem .\data\dem.tif --nmea .\logs\flight.nmea --gt .\logs\ground_truth.csv --lat 60.5 --lon 90.3
+```
+
+Если нужно прогонять вычисления без UI:
+
+```powershell
+python .\main.py --sim --dem .\data\dem.tif --trajectory 1 --no-visualizer
+```
+
 ## Как запускать то, что уже есть
 
 ### Проверка модулей тестами
@@ -284,7 +317,7 @@ dashboard.run(host="127.0.0.1", port=8050, debug=False)
 Запуск всех текущих тестов:
 
 ```powershell
-python -m pytest .\test_sim_generator.py .\test_nmea_parser.py .\test_dem_loader.py .\test_profile_extractor.py .\test_correlator.py .\test_position_solver.py .\test_imm_filter.py .\test_visualizer.py -q
+python -m pytest .\test_sim_generator.py .\test_nmea_parser.py .\test_dem_loader.py .\test_profile_extractor.py .\test_correlator.py .\test_position_solver.py .\test_imm_filter.py .\test_visualizer.py .\test_main.py -q
 ```
 
 ### Минимальный сценарий работы
@@ -298,14 +331,22 @@ python -m pytest .\test_sim_generator.py .\test_nmea_parser.py .\test_dem_loader
 7. Перевести корреляционный результат в координаты через `position_solver.py`
 8. Сгладить навигационное решение через `imm_filter.py`
 9. Показать потоковое состояние в `visualizer.py`
+10. Запустить всё вместе через `main.py`
 
-## Что будет добавлено дальше
+## Полный pipeline
 
-Следующие модули, которые будут появляться в проекте:
-- `main.py`
+Текущая схема работы:
 
-Когда они будут готовы, я буду дополнять этот `README`:
-- новыми командами запуска
-- схемой общего pipeline
-- описанием входных и выходных данных
-- инструкцией для полного запуска проекта end-to-end
+1. `sim_generator.py` генерирует поток NMEA или готовит ground truth
+2. `nmea_parser.py` превращает поток в `NMEAFrame`
+3. `dem_loader.py` читает рельеф и отдаёт высоты/патчи
+4. `profile_extractor.py` строит эталонные профили по азимутам
+5. `correlator.py` ищет лучший `azimuth + offset`
+6. `position_solver.py` строит геодезический fix
+7. `imm_filter.py` сглаживает решение по режимам движения
+8. `visualizer.py` показывает текущее состояние и историю
+9. `main.py` связывает всё в один рабочий pipeline
+
+## Что осталось дальше
+
+Следующий шаг после этого — уже отдельная полноценная интеграционная проверка `integration_test.py`, чтобы прогнать весь pipeline как единое целое по сценариям из задания.
