@@ -138,7 +138,7 @@ class DEMLoader:
             transform=self._raster.transform,
         )
         window = window.round_offsets().round_lengths()
-        patch = self._raster.read(1, window=window, masked=True).filled(np.nan).astype(np.float64)
+        patch = self._raster.read(1, window=window, out_dtype="float64").copy()
         if self.metadata.nodata is not None:
             patch[np.isclose(patch, self.metadata.nodata)] = np.nan
         transform = self._raster.window_transform(window)
@@ -195,7 +195,7 @@ class DEMLoader:
         return float(row), float(col)
 
     def _read_window_array(self, row: float, col: float) -> np.ndarray:
-        data = self._raster.read(1, masked=True).filled(np.nan).astype(np.float64)
+        data = self._raster.read(1, out_dtype="float64").copy()
         if self.metadata.nodata is not None:
             data[np.isclose(data, self.metadata.nodata)] = np.nan
         return data

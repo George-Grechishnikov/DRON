@@ -300,7 +300,9 @@ def generate_points(config: SimulationConfig) -> list[TrajectoryPoint]:
     LOGGER.info("Opening DEM: %s", config.dem_path)
     rng = np.random.default_rng(config.random_seed)
     with rasterio.open(config.dem_path) as dataset:
-        data = np.asarray(dataset.read(1), dtype=np.float64)
+        data = dataset.read(1, out_dtype="float64").copy()
+        if dataset.nodata is not None:
+            data[np.isclose(data, float(dataset.nodata))] = np.nan
         segments = build_segments(config)
         LOGGER.info("Generating %d segment(s) at %.2f Hz", len(segments), config.frequency_hz)
         return list(
