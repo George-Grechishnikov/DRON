@@ -395,6 +395,20 @@ Preflight делает:
 .\.venv\Scripts\python .\scripts\preflight.py --skip-tests
 ```
 
+### Чистка кэша и артефактов
+
+Быстрая чистка проектных кэшей и build-артефактов:
+
+```powershell
+.\.venv\Scripts\python .\scripts\clean_cache.py
+```
+
+Посмотреть, что будет удалено, без фактической очистки:
+
+```powershell
+.\.venv\Scripts\python .\scripts\clean_cache.py --dry-run
+```
+
 ### Проверка модулей тестами
 
 Запуск всех текущих тестов:
