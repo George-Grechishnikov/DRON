@@ -9,6 +9,7 @@
 - `profile_extractor.py` — построитель эталонных профилей рельефа
 - `correlator.py` — корреляционный движок для поиска лучшего азимута и смещения
 - `position_solver.py` — преобразование корреляционного результата в геодезический fix
+- `imm_filter.py` — сглаживание решения через режимы hover/cruise/turn
 
 Этот `README` будем постепенно дополнять по мере реализации следующих задач.
 
@@ -50,12 +51,14 @@ DRON/
   profile_extractor.py
   correlator.py
   position_solver.py
+  imm_filter.py
   test_sim_generator.py
   test_nmea_parser.py
   test_dem_loader.py
   test_profile_extractor.py
   test_correlator.py
   test_position_solver.py
+  test_imm_filter.py
 ```
 
 ## Что уже умеет проект
@@ -222,6 +225,32 @@ print(fix.lat, fix.lon)
 print(fix.speed_mps, fix.azimuth_deg)
 ```
 
+### 7. IMM-фильтр
+
+`imm_filter.py` умеет:
+- смешивать три модели движения `hover / cruise / turn`
+- выполнять цикл `mixing -> predict -> update -> fusion`
+- сглаживать координаты и скорость относительно сырых fix
+- возвращать веса режимов и доминирующую модель
+- считать `HDOP`-подобную оценку горизонтальной неопределённости
+
+Пример использования:
+
+```python
+from imm_filter import IMMFilter
+
+imm = IMMFilter()
+imm_result = imm.update(
+    position_fix=fix,
+    dt=2.0,
+    is_flat=False,
+)
+
+print(imm_result.lat, imm_result.lon)
+print(imm_result.model_weights)
+print(imm_result.dominant_mode)
+```
+
 ## Как запускать то, что уже есть
 
 ### Проверка модулей тестами
@@ -229,7 +258,7 @@ print(fix.speed_mps, fix.azimuth_deg)
 Запуск всех текущих тестов:
 
 ```powershell
-python -m pytest .\test_sim_generator.py .\test_nmea_parser.py .\test_dem_loader.py .\test_profile_extractor.py .\test_correlator.py .\test_position_solver.py -q
+python -m pytest .\test_sim_generator.py .\test_nmea_parser.py .\test_dem_loader.py .\test_profile_extractor.py .\test_correlator.py .\test_position_solver.py .\test_imm_filter.py -q
 ```
 
 ### Минимальный сценарий работы
@@ -241,12 +270,12 @@ python -m pytest .\test_sim_generator.py .\test_nmea_parser.py .\test_dem_loader
 5. Построить эталонную матрицу через `profile_extractor.py`
 6. Найти лучший азимут и смещение через `correlator.py`
 7. Перевести корреляционный результат в координаты через `position_solver.py`
+8. Сгладить навигационное решение через `imm_filter.py`
 
 ## Что будет добавлено дальше
 
 Следующие модули, которые будут появляться в проекте:
 - `position_solver.py`
-- `imm_filter.py`
 - `visualizer.py`
 - `main.py`
 
