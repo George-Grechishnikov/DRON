@@ -8,6 +8,7 @@
 - `dem_loader.py` — загрузчик DEM/ЦМР с выборкой высот и профилей
 - `profile_extractor.py` — построитель эталонных профилей рельефа
 - `correlator.py` — корреляционный движок для поиска лучшего азимута и смещения
+- `position_solver.py` — преобразование корреляционного результата в геодезический fix
 
 Этот `README` будем постепенно дополнять по мере реализации следующих задач.
 
@@ -48,11 +49,13 @@ DRON/
   dem_loader.py
   profile_extractor.py
   correlator.py
+  position_solver.py
   test_sim_generator.py
   test_nmea_parser.py
   test_dem_loader.py
   test_profile_extractor.py
   test_correlator.py
+  test_position_solver.py
 ```
 
 ## Что уже умеет проект
@@ -193,6 +196,32 @@ print(result.best_offset_m)
 print(result.peak_correlation)
 ```
 
+### 6. Решатель позиции и скорости
+
+`position_solver.py` умеет:
+- превращать `best_azimuth + best_offset` в `lat/lon`
+- вычислять путевую скорость из длины окна
+- строить простую ковариацию позиции
+- оценивать скорость и азимут между двумя fix
+- хранить последние `10` навигационных состояний
+
+Пример использования:
+
+```python
+from position_solver import PositionSolver
+
+solver = PositionSolver()
+fix = solver.solve(
+    result=result,
+    start_lat=60.5,
+    start_lon=90.3,
+    window_duration_s=10.0,
+)
+
+print(fix.lat, fix.lon)
+print(fix.speed_mps, fix.azimuth_deg)
+```
+
 ## Как запускать то, что уже есть
 
 ### Проверка модулей тестами
@@ -200,7 +229,7 @@ print(result.peak_correlation)
 Запуск всех текущих тестов:
 
 ```powershell
-python -m pytest .\test_sim_generator.py .\test_nmea_parser.py .\test_dem_loader.py .\test_profile_extractor.py .\test_correlator.py -q
+python -m pytest .\test_sim_generator.py .\test_nmea_parser.py .\test_dem_loader.py .\test_profile_extractor.py .\test_correlator.py .\test_position_solver.py -q
 ```
 
 ### Минимальный сценарий работы
@@ -211,11 +240,11 @@ python -m pytest .\test_sim_generator.py .\test_nmea_parser.py .\test_dem_loader
 4. Использовать `dem_loader.py` для получения профилей рельефа
 5. Построить эталонную матрицу через `profile_extractor.py`
 6. Найти лучший азимут и смещение через `correlator.py`
+7. Перевести корреляционный результат в координаты через `position_solver.py`
 
 ## Что будет добавлено дальше
 
 Следующие модули, которые будут появляться в проекте:
-- `correlator.py`
 - `position_solver.py`
 - `imm_filter.py`
 - `visualizer.py`
