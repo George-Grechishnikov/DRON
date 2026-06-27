@@ -88,6 +88,20 @@ def test_parse_args_sitl_mode() -> None:
     assert config.altitude_msl_m == FIXED_BARO_ALTITUDE_M
 
 
+def test_parse_args_accepts_eskf_engine() -> None:
+    config = parse_args(
+        [
+            "--sim",
+            "--dem",
+            "data/dem.tif",
+            "--engine",
+            "eskf",
+        ]
+    )
+
+    assert config.engine == "eskf"
+
+
 def test_parse_args_uses_dem_center_when_lat_lon_are_omitted() -> None:
     config = parse_args(
         [
@@ -290,3 +304,29 @@ def test_choose_navigation_fix_falls_back_when_terrain_is_uninformative() -> Non
     assert solver.called is False
     assert decision.mode == "terrain_uninformative_fallback"
     assert decision.used_prediction_only is True
+
+
+def test_navigation_decision_can_mark_degraded_fallback_mode() -> None:
+    solver = StubSolver(_solver_fix())
+
+    decision = choose_navigation_fix(
+        config=_config(),
+        corr_result=_corr(is_reliable=False, confidence=0.0),
+        solver=solver,
+        window_start_lat=60.5,
+        window_start_lon=90.3,
+        current_speed=50.0,
+        current_azimuth=45.0,
+        window_duration=10.0,
+        window_counter=5,
+        flat=True,
+        observability=ObservabilityMetrics(
+            crlb_m=float("inf"),
+            gradient_energy=0.0,
+            efficiency_hint=0.0,
+            is_informative=False,
+        ),
+    )
+
+    assert decision.used_prediction_only is True
+    assert decision.fix.is_reliable is False

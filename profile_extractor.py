@@ -85,10 +85,32 @@ class CachedReferenceMatrix:
     matrix: np.ndarray
 
 
+class ReferenceMatrix(np.ndarray):
+    """ndarray with attached azimuth grid metadata."""
+
+    azimuths_deg: np.ndarray
+
+    def __new__(cls, data: np.ndarray, azimuths_deg: np.ndarray) -> "ReferenceMatrix":
+        obj = np.asarray(data, dtype=float).view(cls)
+        obj.azimuths_deg = np.asarray(azimuths_deg, dtype=float).copy()
+        return obj
+
+    def __array_finalize__(self, obj: object | None) -> None:
+        if obj is None:
+            return
+        self.azimuths_deg = getattr(obj, "azimuths_deg", np.empty((0,), dtype=float))
+
+
 class ProfileExtractor:
     """Build reference terrain profiles for all azimuths around a center point."""
 
-    def __init__(self, dem: DEMLoader, profile_length_m: float, step_m: float = 30.0) -> None:
+    def __init__(
+        self,
+        dem: DEMLoader,
+        profile_length_m: float,
+        step_m: float = 30.0,
+        cache_reuse_m: float | None = None,
+    ) -> None:
         if profile_length_m <= 0:
             raise ValueError("profile_length_m must be positive")
         if step_m <= 0:
@@ -97,6 +119,7 @@ class ProfileExtractor:
         self.dem = dem
         self.profile_length_m = float(profile_length_m)
         self.step_m = float(step_m)
+        self.cache_reuse_m = float(cache_reuse_m if cache_reuse_m is not None else (0.25 * self.step_m))
         self.center_lat: float | None = None
         self.center_lon: float | None = None
         self._cached: CachedReferenceMatrix | None = None
@@ -105,10 +128,12 @@ class ProfileExtractor:
         self,
         center_lat: float,
         center_lon: float,
-        azimuths: np.ndarray = np.arange(0, 360, 1.0),
+        azimuths: np.ndarray | None = None,
     ) -> np.ndarray:
         """Build a reference profile matrix for all requested azimuths."""
 
+        if azimuths is None:
+            azimuths = np.arange(0.0, 360.0, 1.0)
         azimuth_array = np.asarray(azimuths, dtype=float)
         azimuth_key = tuple(float(value) for value in azimuth_array.tolist())
         if self._can_reuse_cache(center_lat, center_lon, azimuth_key):
@@ -119,7 +144,7 @@ class ProfileExtractor:
             )
             assert self._cached is not None
             self.update_center(center_lat, center_lon)
-            return self._cached.matrix.copy()
+            return ReferenceMatrix(self._cached.matrix.copy(), np.asarray(self._cached.azimuths, dtype=float))
 
         started_at = time.perf_counter()
         with ThreadPoolExecutor(max_workers=4) as executor:
@@ -152,7 +177,7 @@ class ProfileExtractor:
             center_lon,
             elapsed,
         )
-        return matrix
+        return ReferenceMatrix(matrix, azimuth_array)
 
     def update_center(self, lat: float, lon: float) -> None:
         """Update the currently tracked center location."""
@@ -173,4 +198,4 @@ class ProfileExtractor:
             center_lon,
             center_lat,
         )
-        return distance_m < 200.0
+        return distance_m < self.cache_reuse_m

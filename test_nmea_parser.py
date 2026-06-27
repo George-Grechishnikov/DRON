@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import warnings
 
 import numpy as np
 
@@ -36,7 +37,9 @@ def test_frames_to_profile_interpolates_missing_values() -> None:
         NMEAFrame(timestamp_utc="3", radar_alt_m=120.0, raw="", valid=True),
     ]
 
-    profile = frames_to_profile(frames, speed_mps=50.0, freq_hz=5.0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        profile = frames_to_profile(frames, speed_mps=50.0, freq_hz=5.0)
 
     assert profile.shape == (3,)
     assert np.allclose(profile, np.array([100.0, 110.0, 120.0]))

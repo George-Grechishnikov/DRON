@@ -68,6 +68,30 @@ class PositionSolver:
         if window_duration_s <= 0:
             raise ValueError("window_duration_s must be positive")
 
+        previous_fix = self._history[-1] if self._history else None
+        fix = self.solve_with_velocity(
+            result=result,
+            start_lat=start_lat,
+            start_lon=start_lon,
+            window_duration_s=window_duration_s,
+            prev_fix=previous_fix,
+        )
+        self._history.append(fix)
+        return fix
+
+    def solve_with_velocity(
+        self,
+        result: CorrelationResult,
+        start_lat: float,
+        start_lon: float,
+        window_duration_s: float,
+        prev_fix: PositionEstimate | None,
+    ) -> PositionEstimate:
+        """Convert correlation output into a fix, deriving motion from sequential fixes when possible."""
+
+        if window_duration_s <= 0:
+            raise ValueError("window_duration_s must be positive")
+
         azimuth_deg = normalize_azimuth_deg(result.best_azimuth_deg)
         end_lon, end_lat, _ = self.geod.fwd(
             start_lon,
@@ -76,21 +100,71 @@ class PositionSolver:
             result.best_offset_m,
         )
         speed_mps = result.best_offset_m / window_duration_s
-        sigma_pos = max(1.0, 150.0 * (1.0 - result.peak_correlation))
-        cov_matrix = np.diag([sigma_pos**2, sigma_pos**2]).astype(float)
+        timestamp_s = (
+            prev_fix.timestamp_s + window_duration_s
+            if prev_fix is not None
+            else float(time.time())
+        )
+        cov_matrix = self._position_covariance(result, azimuth_deg)
 
         fix = PositionEstimate(
             lat=float(end_lat),
             lon=float(end_lon),
             speed_mps=float(speed_mps),
             azimuth_deg=azimuth_deg,
-            timestamp_s=float(time.time()),
+            timestamp_s=timestamp_s,
             confidence=float(result.confidence),
             is_reliable=bool(result.is_reliable),
             cov_matrix=cov_matrix,
         )
-        self._history.append(fix)
+
+        if prev_fix is not None:
+            measured_speed_mps, measured_azimuth_deg = self.estimate_velocity_from_two_fixes(prev_fix, fix)
+            fix = PositionEstimate(
+                lat=fix.lat,
+                lon=fix.lon,
+                speed_mps=float(measured_speed_mps),
+                azimuth_deg=float(measured_azimuth_deg),
+                timestamp_s=fix.timestamp_s,
+                confidence=fix.confidence,
+                is_reliable=fix.is_reliable,
+                cov_matrix=fix.cov_matrix,
+            )
         return fix
+
+    def _position_covariance(
+        self,
+        result: CorrelationResult,
+        azimuth_deg: float,
+    ) -> np.ndarray:
+        """Build a 2x2 EN covariance from along-track and cross-track uncertainty."""
+
+        sigma_along = self._sanitize_sigma(result.sigma_offset_m, fallback_m=150.0 * (1.0 - result.peak_correlation))
+        sigma_cross = self._sanitize_sigma(result.sigma_azimuth_m, fallback_m=max(sigma_along, 25.0))
+
+        if not result.informative:
+            sigma_along *= 5.0
+            sigma_cross *= 5.0
+
+        azimuth_rad = math.radians(normalize_azimuth_deg(azimuth_deg))
+        basis = np.array(
+            [
+                [math.sin(azimuth_rad), math.cos(azimuth_rad)],
+                [math.cos(azimuth_rad), -math.sin(azimuth_rad)],
+            ],
+            dtype=float,
+        )
+        cov_track = np.diag([sigma_along**2, sigma_cross**2]).astype(float)
+        cov_matrix = basis @ cov_track @ basis.T
+        return cov_matrix.astype(float)
+
+    @staticmethod
+    def _sanitize_sigma(sigma_m: float, *, fallback_m: float) -> float:
+        """Return a stable positive sigma in meters."""
+
+        if np.isfinite(sigma_m) and sigma_m > 1e-6:
+            return float(sigma_m)
+        return float(max(fallback_m, 1.0))
 
     def estimate_velocity_from_two_fixes(
         self,

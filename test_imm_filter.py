@@ -96,3 +96,33 @@ def test_flat_terrain_increases_hdop() -> None:
     hdop = imm.get_hdop()
 
     assert hdop > 0.0
+
+
+def test_measurement_covariance_preserves_anisotropic_position_block() -> None:
+    geod = pyproj.Geod(ellps="WGS84")
+    imm = IMMFilter()
+    fix = _make_fix(
+        geod=geod,
+        start_lat=60.5,
+        start_lon=90.3,
+        azimuth_deg=30.0,
+        distance_m=100.0,
+        speed_mps=30.0,
+        timestamp_s=2.0,
+    )
+    anisotropic_cov = np.array([[900.0, 120.0], [120.0, 2500.0]], dtype=float)
+    fix = PositionEstimate(
+        lat=fix.lat,
+        lon=fix.lon,
+        speed_mps=fix.speed_mps,
+        azimuth_deg=fix.azimuth_deg,
+        timestamp_s=fix.timestamp_s,
+        confidence=fix.confidence,
+        is_reliable=fix.is_reliable,
+        cov_matrix=anisotropic_cov,
+    )
+
+    measurement_cov = imm._measurement_covariance(fix, is_flat=False)
+
+    assert measurement_cov.shape == (4, 4)
+    assert np.allclose(measurement_cov[:2, :2], anisotropic_cov, atol=1e-9)

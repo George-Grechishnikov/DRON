@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import socket
+import warnings
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -222,6 +223,12 @@ def frames_to_profile(
 ) -> np.ndarray:
     """Convert frames into a 1D terrain profile array."""
 
+    warnings.warn(
+        "frames_to_profile() is deprecated for terrain reconstruction; use "
+        "measurement_layer.frames_to_terrain_profile() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if speed_mps <= 0:
         raise ValueError("speed_mps must be positive")
     if freq_hz <= 0:
@@ -233,4 +240,3 @@ def frames_to_profile(
     altitudes = np.array([frame.radar_alt_m for frame in frames], dtype=float)
     profile = _interpolate_missing(altitudes)
     return profile
-

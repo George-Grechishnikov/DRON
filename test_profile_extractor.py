@@ -11,6 +11,9 @@ from profile_extractor import (
 
 
 class SyntheticDEMLoader:
+    def __init__(self) -> None:
+        self.call_count = 0
+
     def get_profile_along_azimuth(
         self,
         lat: float,
@@ -19,6 +22,7 @@ class SyntheticDEMLoader:
         distance_m: float,
         step_m: float = 30.0,
     ) -> np.ndarray:
+        self.call_count += 1
         length = int(np.floor(distance_m / step_m)) + 1
         x = np.linspace(0.0, distance_m, length)
         phase = np.deg2rad(azimuth_deg)
@@ -35,6 +39,35 @@ def test_build_reference_matrix_shape_and_cache() -> None:
 
     assert matrix1.shape == (4, 31)
     assert np.allclose(matrix1, matrix2)
+
+
+def test_build_reference_matrix_supports_custom_azimuth_grid() -> None:
+    dem = SyntheticDEMLoader()
+    extractor = ProfileExtractor(dem=dem, profile_length_m=900.0, step_m=30.0)
+
+    azimuths = np.array([10.0, 10.5, 11.0, 11.5], dtype=float)
+    matrix = extractor.build_reference_matrix(60.5, 90.3, azimuths=azimuths)
+
+    assert matrix.shape == (4, 31)
+    assert np.allclose(matrix.azimuths_deg, azimuths)
+
+
+def test_cache_is_not_reused_after_shift_exceeds_threshold() -> None:
+    dem = SyntheticDEMLoader()
+    extractor = ProfileExtractor(
+        dem=dem,
+        profile_length_m=900.0,
+        step_m=30.0,
+        cache_reuse_m=5.0,
+    )
+    azimuths = np.array([0.0, 45.0, 90.0], dtype=float)
+
+    extractor.build_reference_matrix(60.5, 90.3, azimuths=azimuths)
+    first_call_count = dem.call_count
+    extractor.build_reference_matrix(60.5002, 90.3002, azimuths=azimuths)
+
+    assert first_call_count == azimuths.size
+    assert dem.call_count == azimuths.size * 2
 
 
 def test_normalize_profile_has_zero_mean_and_unit_std() -> None:

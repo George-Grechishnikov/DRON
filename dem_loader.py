@@ -103,10 +103,10 @@ class DEMLoader:
     def get_elevation(self, lat: float, lon: float) -> float:
         """Return bilinearly interpolated elevation at lat/lon."""
 
-        self._validate_bounds(lat, lon)
-        row, col = self._fractional_index(lat, lon)
-        data = self._read_window_array(row, col)
-        sampled = map_coordinates(data, [[row], [col]], order=1, mode="nearest")[0]
+        sampled = self._sample_points(
+            np.asarray([lat], dtype=float),
+            np.asarray([lon], dtype=float),
+        )[0]
         if np.isnan(sampled):
             return float("nan")
         return float(sampled)
@@ -186,8 +186,10 @@ class DEMLoader:
             np.full(steps, azimuth_deg, dtype=float),
             distances,
         )
-        values = [self.get_elevation(point_lat, point_lon) for point_lon, point_lat in zip(lons, lats)]
-        return np.asarray(values, dtype=float)
+        return self._sample_points(
+            np.asarray(lats, dtype=float),
+            np.asarray(lons, dtype=float),
+        )
 
     def preload_route(
         self, waypoints: list[tuple[float, float]], radius_m: float = 5000
@@ -208,9 +210,44 @@ class DEMLoader:
         col, row = (~self._raster.transform) * (lon, lat)
         return float(row), float(col)
 
-    def _read_window_array(self, row: float, col: float) -> np.ndarray:
-        del row, col
-        return self._data
+    def _sample_points(self, lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
+        """Return bilinearly sampled DEM elevations for a batch of points."""
+
+        lat_array = np.asarray(lats, dtype=float)
+        lon_array = np.asarray(lons, dtype=float)
+        if lat_array.shape != lon_array.shape:
+            raise ValueError("lats and lons must have the same shape")
+        if lat_array.ndim != 1:
+            lat_array = lat_array.reshape(-1)
+            lon_array = lon_array.reshape(-1)
+
+        rows, cols = (~self._raster.transform) * (lon_array, lat_array)
+        rows = np.asarray(rows, dtype=float)
+        cols = np.asarray(cols, dtype=float)
+        valid = (
+            (rows >= 0.0)
+            & (rows <= self._data.shape[0] - 1)
+            & (cols >= 0.0)
+            & (cols <= self._data.shape[1] - 1)
+        )
+
+        sampled = np.full(rows.shape, np.nan, dtype=float)
+        if not np.any(valid):
+            return sampled
+
+        safe_rows = np.clip(rows[valid], 0.0, self._data.shape[0] - 1)
+        safe_cols = np.clip(cols[valid], 0.0, self._data.shape[1] - 1)
+        sampled = map_coordinates(
+            self._data,
+            [safe_rows, safe_cols],
+            order=1,
+            mode="nearest",
+        )
+        sampled = np.asarray(sampled, dtype=float)
+        sampled[np.isnan(sampled)] = np.nan
+        result = np.full(rows.shape, np.nan, dtype=float)
+        result[valid] = sampled
+        return result
 
     def _validate_bounds(self, lat: float, lon: float) -> None:
         left, bottom, right, top = self.metadata.bounds

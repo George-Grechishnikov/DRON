@@ -21,10 +21,13 @@ import pyproj
 from correlator import Correlator, CorrelationResult, ObservabilityMetrics, compute_observability_metrics
 from constants import FIXED_BARO_ALTITUDE_M
 from dem_loader import DEMLoader
+from eskf import ESKF, ImuSample
 from imm_filter import IMMFilter, IMMResult
+from measurement_layer import BaroTrack, frames_to_terrain_profile, update_terrain_bias
 from nmea_parser import NMEAFrame, NMEAReader, parse_line
 from position_solver import PositionEstimate, PositionSolver
 from profile_extractor import ProfileExtractor, is_flat_terrain
+from terrain_pf import TerrainParticleFilter
 from sim_generator import SimulationConfig, TrajectoryPoint, format_gpgga, generate_points
 from sitl_bridge import SITLBridge
 from visualizer import TerrainNavigatorDash, export_flight_report
@@ -68,6 +71,7 @@ class Config:
     flat_terrain_threshold_m: float = 15.0
     cold_start_windows: int = 3
     log_level: str = "INFO"
+    engine: str = "legacy"
 
 
 @dataclass(frozen=True)
@@ -164,6 +168,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-offset", type=float, default=2000.0, help="Maximum correlation offset in meters")
     parser.add_argument("--flat-threshold", type=float, default=15.0, help="Flat-terrain threshold in meters")
     parser.add_argument("--cold-start-windows", type=int, default=3, help="Windows before GNSS-like binding starts")
+    parser.add_argument("--engine", choices=("legacy", "eskf"), default="legacy", help="Navigation core to run")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     return parser
 
@@ -222,6 +227,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         flat_terrain_threshold_m=args.flat_threshold,
         cold_start_windows=args.cold_start_windows,
         log_level=args.log_level,
+        engine=args.engine,
     )
 
 
@@ -330,6 +336,7 @@ def make_simulation_points(config: Config) -> list[TrajectoryPoint]:
         output_mode="file",
         out_nmea=None,
         out_csv=None,
+        out_imu=None,
         udp_host=config.udp_host,
         udp_port=config.udp_port,
         random_seed=config.seed,
@@ -550,6 +557,60 @@ def predict_fix(
     )
 
 
+def build_path_offsets_enu(
+    speed_mps: float,
+    azimuth_deg: float,
+    sample_count: int,
+    sample_dt: float,
+) -> np.ndarray:
+    """Build ENU offsets for a window along a simple recent trajectory hypothesis."""
+
+    if sample_count <= 0:
+        return np.empty((0, 2), dtype=float)
+    azimuth_rad = math.radians(float(azimuth_deg) % 360.0)
+    velocity_xy = np.array(
+        [speed_mps * math.sin(azimuth_rad), speed_mps * math.cos(azimuth_rad)],
+        dtype=float,
+    )
+    times = np.arange(sample_count, dtype=float) * float(sample_dt)
+    return times[:, np.newaxis] * velocity_xy[np.newaxis, :]
+
+
+def make_level_imu_sample(speed_mps: float, azimuth_deg: float, prev_azimuth_deg: float, dt: float) -> ImuSample:
+    """Build a simple synthetic IMU sample from scalar motion."""
+
+    del speed_mps
+    delta_heading_deg = ((azimuth_deg - prev_azimuth_deg + 180.0) % 360.0) - 180.0
+    yaw_rate_rps = math.radians(delta_heading_deg) / max(dt, 1e-6)
+    return ImuSample(
+        timestamp_s=time.time(),
+        accel_mps2=np.array([0.0, 0.0, 9.80665], dtype=float),
+        gyro_rps=np.array([0.0, 0.0, yaw_rate_rps], dtype=float),
+    )
+
+
+def eskf_state_to_imm_result(eskf: ESKF) -> IMMResult:
+    """Convert ESKF state into the legacy result container for metrics/UI compatibility."""
+
+    lat, lon, _ = eskf.to_geodetic()
+    velocity = eskf.state.v_enu_mps
+    speed_mps = float(np.linalg.norm(velocity[:2]))
+    azimuth_deg = float((math.degrees(math.atan2(velocity[0], velocity[1])) + 360.0) % 360.0) if speed_mps > 1e-6 else 0.0
+    covariance = np.eye(4, dtype=float)
+    covariance[:2, :2] = eskf.covariance[:2, :2]
+    covariance[2, 2] = max(float(eskf.covariance[3, 3]), 1e-6)
+    covariance[3, 3] = max(float(eskf.covariance[4, 4]), 1e-6)
+    return IMMResult(
+        lat=float(lat),
+        lon=float(lon),
+        speed_mps=speed_mps,
+        azimuth_deg=azimuth_deg,
+        model_weights=np.array([0.0, 0.0, 1.0], dtype=float),
+        covariance=covariance,
+        dominant_mode="eskf",
+    )
+
+
 def choose_navigation_fix(
     *,
     config: Config,
@@ -671,7 +732,9 @@ def select_processing_window(
     buffer: deque[FramePacket],
     correlator: Correlator,
     ref_matrix: np.ndarray,
+    azimuths_deg: np.ndarray,
     measurement_step_m: float,
+    terrain_bias_m: float,
 ) -> WindowSelection | None:
     """Select a fixed or adaptive processing window based on observability and ambiguity."""
 
@@ -680,18 +743,20 @@ def select_processing_window(
         return None
 
     evaluations: list[WindowSelection] = []
-    azimuth_axis = np.arange(0.0, ref_matrix.shape[0], 1.0)
+    baro_track = BaroTrack(default_msl_m=config.altitude_msl_m)
     for candidate_size in candidate_sizes:
         frame_packets = list(buffer)[-candidate_size:]
-        h_meas = np.array(
-            [config.altitude_msl_m - item.frame.radar_alt_m for item in frame_packets],
-            dtype=float,
+        terrain_profile = frames_to_terrain_profile(
+            [item.frame for item in frame_packets],
+            baro_track,
+            terrain_bias_m=terrain_bias_m,
         )
+        h_meas = terrain_profile.values_m
         flat = is_flat_terrain(h_meas, threshold_m=config.flat_terrain_threshold_m)
         corr_result = correlator.compute(
             h_meas=h_meas,
             ref_matrix=ref_matrix,
-            azimuths_deg=azimuth_axis,
+            azimuths_deg=azimuths_deg,
         )
         observability = compute_observability_metrics(
             corr_result.best_reference_profile,
@@ -752,13 +817,14 @@ def pipeline_worker(
     current_azimuth = 45.0
     current_speed = config.speed_mps
     step_dt = config.step_size / config.freq_hz
-    default_window_duration = config.window_size / config.freq_hz
     window_counter = 0
+    terrain_bias_m = 0.0
     measurement_step_m = config.speed_mps / config.freq_hz
     measured_profile_length_m = config.max_window_size * measurement_step_m if config.adaptive_window else config.window_size * measurement_step_m
     reference_profile_length_m = measured_profile_length_m + config.max_offset_m
 
     with DEMLoader(config.dem_path) as dem:
+        azimuth_axis = np.arange(0.0, 360.0, 1.0, dtype=float)
         extractor = ProfileExtractor(
             dem,
             profile_length_m=reference_profile_length_m,
@@ -771,6 +837,16 @@ def pipeline_worker(
         )
         solver = PositionSolver()
         imm = IMMFilter()
+        eskf = ESKF(window_start_lat, window_start_lon, origin_alt_m=config.altitude_msl_m)
+        terrain_pf = TerrainParticleFilter(
+            dem,
+            n_particles=800,
+            meas_sigma_m=max(config.noise_sigma, 3.0),
+            resample_threshold=0.6,
+            terrain_bias_m=terrain_bias_m,
+        )
+        terrain_pf.initialize_around(window_start_lat, window_start_lon, sigma_m=500.0)
+        baro_track = BaroTrack(default_msl_m=config.altitude_msl_m)
 
         while not stop_event.is_set():
             try:
@@ -785,43 +861,225 @@ def pipeline_worker(
             if len(buffer) < minimum_frames:
                 continue
 
-            ref_matrix = extractor.build_reference_matrix(window_start_lat, window_start_lon)
-            selection = select_processing_window(
-                config=config,
-                buffer=buffer,
-                correlator=correlator,
-                ref_matrix=ref_matrix,
-                measurement_step_m=measurement_step_m,
-            )
-            if selection is None:
+            if config.engine == "eskf":
+                frame_packets = list(buffer)[-minimum_frames:]
+                selected_window_size = len(frame_packets)
+                center_frame_index = frame_packets[-1].index
+                latest_packet = frame_packets[-1]
+                frames_window = [item.frame for item in frame_packets]
+                terrain_profile = frames_to_terrain_profile(
+                    frames_window,
+                    baro_track,
+                    terrain_bias_m=terrain_bias_m,
+                )
+                h_meas = terrain_profile.values_m
+                flat = is_flat_terrain(h_meas, threshold_m=config.flat_terrain_threshold_m)
+                observability = compute_observability_metrics(
+                    h_meas[np.isfinite(h_meas)] if np.any(np.isfinite(h_meas)) else np.empty((0,), dtype=float),
+                    sigma_noise_m=max(config.noise_sigma, 1e-3),
+                    step_m=measurement_step_m,
+                )
+                imu = make_level_imu_sample(current_speed, current_azimuth, current_azimuth, step_dt)
+                eskf.predict(imu, step_dt)
+                eskf.update_baro(config.altitude_msl_m, sigma_m=5.0)
+                process_cov = np.diag([max(current_speed * step_dt, 5.0) ** 2, max(current_speed * step_dt, 5.0) ** 2]).astype(float)
+                terrain_pf.terrain_bias_m = terrain_bias_m
+                terrain_pf.predict(
+                    np.asarray(eskf.state.v_enu_mps[:2], dtype=float) * step_dt,
+                    process_cov=process_cov,
+                )
+                path_offsets = build_path_offsets_enu(
+                    speed_mps=max(current_speed, 1e-3),
+                    azimuth_deg=current_azimuth,
+                    sample_count=len(h_meas),
+                    sample_dt=1.0 / config.freq_hz,
+                )
+                terrain_update = terrain_pf.update(h_meas, path_offsets)
+                current_position_enu = terrain_update.p_enu_m + (path_offsets[-1] if path_offsets.size else np.zeros(2, dtype=float))
+                eskf.update_position(current_position_enu, terrain_update.cov_2x2)
+                eskf_result = eskf_state_to_imm_result(eskf)
+                if latest_packet.truth_speed_mps is not None and latest_packet.truth_heading_deg is not None:
+                    current_speed = float(latest_packet.truth_speed_mps)
+                    current_azimuth = float(latest_packet.truth_heading_deg)
+                else:
+                    current_speed = eskf_result.speed_mps
+                    current_azimuth = eskf_result.azimuth_deg if eskf_result.speed_mps > 1e-6 else current_azimuth
+                if terrain_update.converged:
+                    terrain_bias_m = update_terrain_bias(
+                        terrain_bias_m,
+                        float(np.nanmedian(h_meas - np.nanmedian(h_meas))),
+                        gain=0.02,
+                    )
+                corr_result = CorrelationResult(
+                    best_azimuth_deg=current_azimuth,
+                    best_offset_steps=0,
+                    best_offset_m=0.0,
+                    confidence=1.0 / (1.0 + terrain_update.entropy),
+                    peak_correlation=1.0 / (1.0 + terrain_update.entropy),
+                    is_reliable=terrain_update.converged,
+                    informative=observability.is_informative,
+                    heatmap=np.zeros((360, 1), dtype=float),
+                    azimuths_deg=np.arange(360.0, dtype=float),
+                    best_reference_profile=h_meas.copy(),
+                )
+                try:
+                    dem_patch, _ = dem.get_patch(eskf_result.lat, eskf_result.lon, radius_m=config.dem_patch_radius_m)
+                except ValueError:
+                    fallback_lat, fallback_lon = dem.get_center()
+                    dem_patch, _ = dem.get_patch(fallback_lat, fallback_lon, radius_m=config.dem_patch_radius_m)
+                history.append((center_frame_index, eskf_result))
+                _enqueue_state(
+                    state_queue,
+                    {
+                        "corr": corr_result,
+                        "fix": eskf_result,
+                        "h_meas": h_meas,
+                        "ref": corr_result.best_reference_profile,
+                        "dem_patch": dem_patch,
+                        "hdop": float(math.sqrt(max(np.trace(terrain_update.cov_2x2), 0.0))),
+                        "nav_mode": "eskf_terrain_pf",
+                        "used_prediction_only": not terrain_update.converged,
+                        "degraded": flat or (not observability.is_informative),
+                        "selected_window_size": selected_window_size,
+                        "gnss_available": latest_packet.gnss_available,
+                        "truth": (
+                            {
+                                "lat": latest_packet.truth_lat,
+                                "lon": latest_packet.truth_lon,
+                                "heading_deg": latest_packet.truth_heading_deg,
+                                "speed_mps": latest_packet.truth_speed_mps,
+                            }
+                            if latest_packet.truth_lat is not None and latest_packet.truth_lon is not None
+                            else None
+                        ),
+                        "observability": {
+                            "crlb_m": observability.crlb_m,
+                            "gradient_energy": observability.gradient_energy,
+                            "efficiency_hint": observability.efficiency_hint,
+                            "is_informative": observability.is_informative,
+                        },
+                        "terrain_bias_m": terrain_bias_m,
+                    },
+                    stop_event,
+                )
+                for _ in range(min(config.step_size, len(buffer))):
+                    if buffer:
+                        buffer.popleft()
+                window_start_lat = eskf_result.lat
+                window_start_lon = eskf_result.lon
+                window_counter += 1
                 continue
 
-            frames_window = [item.frame for item in selection.frame_packets]
-            center_frame_index = selection.frame_packets[-1].index
-            latest_packet = selection.frame_packets[-1]
-            h_meas = np.array(
-                [config.altitude_msl_m - frame.radar_alt_m for frame in frames_window],
-                dtype=float,
-            )
-            flat = selection.flat
-            corr_result = selection.corr_result
-            observability = selection.observability
-            window_duration = selection.window_size / config.freq_hz
+            degraded = False
+            selected_window_size = 0
+            try:
+                ref_matrix = extractor.build_reference_matrix(
+                    window_start_lat,
+                    window_start_lon,
+                    azimuths=azimuth_axis,
+                )
+                selection = select_processing_window(
+                    config=config,
+                    buffer=buffer,
+                    correlator=correlator,
+                    ref_matrix=ref_matrix,
+                    azimuths_deg=azimuth_axis,
+                    measurement_step_m=measurement_step_m,
+                    terrain_bias_m=terrain_bias_m,
+                )
+                if selection is None:
+                    continue
 
-            nav_decision = choose_navigation_fix(
-                config=config,
-                corr_result=corr_result,
-                solver=solver,
-                window_start_lat=window_start_lat,
-                window_start_lon=window_start_lon,
-                current_speed=current_speed,
-                current_azimuth=current_azimuth,
-                window_duration=window_duration,
-                window_counter=window_counter,
-                flat=flat,
-                observability=observability,
-            )
-            position_fix = nav_decision.fix
+                selected_window_size = selection.window_size
+                frames_window = [item.frame for item in selection.frame_packets]
+                center_frame_index = selection.frame_packets[-1].index
+                latest_packet = selection.frame_packets[-1]
+                terrain_profile = frames_to_terrain_profile(
+                    frames_window,
+                    baro_track,
+                    terrain_bias_m=terrain_bias_m,
+                )
+                h_meas = terrain_profile.values_m
+                flat = selection.flat
+                corr_result = selection.corr_result
+                observability = selection.observability
+                window_duration = selection.window_size / config.freq_hz
+
+                nav_decision = choose_navigation_fix(
+                    config=config,
+                    corr_result=corr_result,
+                    solver=solver,
+                    window_start_lat=window_start_lat,
+                    window_start_lon=window_start_lon,
+                    current_speed=current_speed,
+                    current_azimuth=current_azimuth,
+                    window_duration=window_duration,
+                    window_counter=window_counter,
+                    flat=flat,
+                    observability=observability,
+                )
+                position_fix = nav_decision.fix
+                degraded = nav_decision.used_prediction_only or (not corr_result.informative)
+                if (
+                    not nav_decision.used_prediction_only
+                    and corr_result.is_reliable
+                    and corr_result.best_reference_profile.size == h_meas.size
+                ):
+                    residual_m = float(
+                        np.nanmedian(h_meas - corr_result.best_reference_profile)
+                    )
+                    terrain_bias_m = update_terrain_bias(
+                        terrain_bias_m,
+                        residual_m,
+                        gain=0.1,
+                    )
+            except Exception:
+                LOGGER.exception("Window processing failed, switching to degraded coasting mode")
+                selection_window_size = min(len(buffer), config.window_size)
+                selected_window_size = selection_window_size
+                frame_packets = list(buffer)[-selection_window_size:]
+                center_frame_index = frame_packets[-1].index
+                latest_packet = frame_packets[-1]
+                frames_window = [item.frame for item in frame_packets]
+                h_meas = frames_to_terrain_profile(
+                    frames_window,
+                    baro_track,
+                    terrain_bias_m=terrain_bias_m,
+                ).values_m
+                flat = True
+                corr_result = CorrelationResult(
+                    best_azimuth_deg=current_azimuth,
+                    best_offset_steps=0,
+                    best_offset_m=0.0,
+                    peak_correlation=0.0,
+                    confidence=0.0,
+                    is_reliable=False,
+                    informative=False,
+                    heatmap=np.zeros((360, 1), dtype=float),
+                    azimuths_deg=np.arange(360.0, dtype=float),
+                    best_reference_profile=np.zeros_like(h_meas),
+                )
+                observability = ObservabilityMetrics(
+                    crlb_m=float("inf"),
+                    gradient_energy=0.0,
+                    efficiency_hint=0.0,
+                    is_informative=False,
+                )
+                window_duration = selection_window_size / config.freq_hz
+                nav_decision = NavigationDecision(
+                    fix=predict_fix(
+                        current_lat=window_start_lat,
+                        current_lon=window_start_lon,
+                        speed_mps=current_speed,
+                        azimuth_deg=current_azimuth,
+                        dt=window_duration,
+                        confidence=0.0,
+                    ),
+                    mode="terrain_exception_fallback",
+                    used_prediction_only=True,
+                )
+                position_fix = nav_decision.fix
+                degraded = True
 
             imm_result = imm.update(position_fix, dt=step_dt, is_flat=flat)
             current_azimuth = imm_result.azimuth_deg
@@ -840,7 +1098,8 @@ def pipeline_worker(
                     "hdop": imm.get_hdop(),
                     "nav_mode": nav_decision.mode,
                     "used_prediction_only": nav_decision.used_prediction_only,
-                    "selected_window_size": selection.window_size,
+                    "degraded": degraded,
+                    "selected_window_size": selected_window_size,
                     "gnss_available": latest_packet.gnss_available,
                     "truth": (
                         {
@@ -858,6 +1117,7 @@ def pipeline_worker(
                         "efficiency_hint": observability.efficiency_hint,
                         "is_informative": observability.is_informative,
                     },
+                    "terrain_bias_m": terrain_bias_m,
                 },
                 stop_event,
             )

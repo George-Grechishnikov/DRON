@@ -85,3 +85,50 @@ def test_full_sim_pipeline_produces_reasonable_metrics(tmp_path: Path, monkeypat
     assert np.isfinite(metrics.speed_error_mps)
     assert np.isfinite(metrics.azimuth_error_deg)
     assert (tmp_path / "output" / "terrain_navigator_report.html").exists()
+
+
+def test_full_sim_pipeline_runs_with_eskf_engine(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    dem_path = tmp_path / "integration_dem_eskf.tif"
+    _write_integration_dem(dem_path)
+
+    config = Config(
+        mode="sim",
+        dem_path=dem_path,
+        start_lat=60.5,
+        start_lon=90.3,
+        trajectory=1,
+        nmea_path=None,
+        gt_path=None,
+        sitl_connection="udp:127.0.0.1:14550",
+        sitl_gnss_drop_after_s=None,
+        sitl_gnss_recover_after_s=None,
+        udp_host="127.0.0.1",
+        udp_port=10110,
+        dashboard_host="127.0.0.1",
+        dashboard_port=8050,
+        enable_visualizer=False,
+        seed=42,
+        speed_mps=50.0,
+        altitude_msl_m=1500.0,
+        noise_sigma=0.8,
+        window_size=50,
+        adaptive_window=False,
+        min_window_size=50,
+        max_window_size=50,
+        window_growth_step=10,
+        step_size=10,
+        freq_hz=5.0,
+        dem_patch_radius_m=5000.0,
+        max_offset_m=2000.0,
+        flat_terrain_threshold_m=15.0,
+        cold_start_windows=3,
+        log_level="INFO",
+        engine="eskf",
+    )
+
+    history, metrics = run_pipeline(config)
+
+    assert len(history) >= 5
+    assert metrics is not None
+    assert np.isfinite(metrics.mean_error_m)

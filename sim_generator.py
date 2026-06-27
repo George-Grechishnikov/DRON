@@ -49,6 +49,19 @@ class TrajectoryPoint:
 
 
 @dataclass(frozen=True)
+class SyntheticImuPoint:
+    """One synthetic IMU row aligned with the generated trajectory."""
+
+    timestamp_s: float
+    accel_x_mps2: float
+    accel_y_mps2: float
+    accel_z_mps2: float
+    gyro_x_rps: float
+    gyro_y_rps: float
+    gyro_z_rps: float
+
+
+@dataclass(frozen=True)
 class Segment:
     """Route segment definition."""
 
@@ -71,6 +84,7 @@ class SimulationConfig:
     output_mode: str
     out_nmea: Path | None
     out_csv: Path | None
+    out_imu: Path | None
     udp_host: str
     udp_port: int
     random_seed: int
@@ -80,6 +94,16 @@ class SimulationConfig:
     duration_s: float | None
     length_km: float | None
     trajectory_id: int | None
+    beam_width_deg: float = 0.0
+    beam_aggregation: str = "mean"
+    spike_prob: float = 0.0
+    spike_sigma_m: float = 50.0
+    dropout_prob: float = 0.0
+    water_multipath_extra_sigma_m: float = 0.0
+    realistic: bool = False
+    surface_bias_mode: str = "none"
+    surface_bias_m: float = 0.0
+    surface_mask: Path | None = None
 
 
 def nmea_checksum(sentence: str) -> str:
@@ -110,7 +134,7 @@ def format_gpgga(timestamp_s: float, radar_alt_m: float) -> str:
         "1",
         "08",
         "1.0",
-        f"{radar_alt_m:.1f}",
+        "" if not np.isfinite(radar_alt_m) else f"{radar_alt_m:.1f}",
         "M",
         "0.0",
         "M",
@@ -238,6 +262,137 @@ def build_segments(config: SimulationConfig) -> list[Segment]:
     ]
 
 
+def _sample_disc_terrain(
+    dataset: rasterio.io.DatasetReader,
+    data: np.ndarray,
+    lat: float,
+    lon: float,
+    radius_m: float,
+    aggregation: str,
+) -> tuple[float, np.ndarray]:
+    """Sample terrain over a small disc footprint and aggregate it."""
+
+    if radius_m <= 1e-6:
+        terrain = sample_dem_bilinear(dataset, data, lat, lon)
+        return terrain, np.array([terrain], dtype=float)
+
+    bearings = np.array([0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0], dtype=float)
+    lons, lats, _ = WGS84_GEOD.fwd(
+        np.full(bearings.shape, lon, dtype=float),
+        np.full(bearings.shape, lat, dtype=float),
+        bearings,
+        np.full(bearings.shape, radius_m, dtype=float),
+    )
+    samples = [sample_dem_bilinear(dataset, data, lat, lon)]
+    for point_lat, point_lon in zip(lats, lons):
+        samples.append(sample_dem_bilinear(dataset, data, float(point_lat), float(point_lon)))
+    values = np.asarray(samples, dtype=float)
+    if aggregation == "min":
+        return float(np.nanmin(values)), values
+    return float(np.nanmean(values)), values
+
+
+def _segment_bank_angle_deg(segments: Sequence[Segment], segment_index: int) -> float:
+    """Estimate a simple bank angle on turning segments from heading change."""
+
+    previous_azimuth = segments[segment_index - 1].azimuth_deg if segment_index > 0 else segments[segment_index].azimuth_deg
+    current_azimuth = segments[segment_index].azimuth_deg
+    delta = ((current_azimuth - previous_azimuth + 180.0) % 360.0) - 180.0
+    return float(min(abs(delta) * 0.5, 25.0))
+
+
+def _is_water_like(terrain_samples: np.ndarray) -> bool:
+    """Heuristic water detector for synthetic DEM experiments."""
+
+    values = np.asarray(terrain_samples, dtype=float)
+    if values.size == 0:
+        return False
+    return bool(np.nanstd(values) < 0.05 and abs(float(np.nanmean(values))) < 1.0)
+
+
+def _surface_bias_at(
+    *,
+    config: SimulationConfig,
+    dataset: rasterio.io.DatasetReader,
+    data: np.ndarray,
+    lat: float,
+    lon: float,
+    terrain_samples: np.ndarray,
+    mask_dataset: rasterio.io.DatasetReader | None,
+    mask_data: np.ndarray | None,
+) -> float:
+    """Return a surface-related bias for canopy/snow-like conditions."""
+
+    if config.surface_bias_mode == "none" or abs(config.surface_bias_m) <= 1e-9:
+        return 0.0
+    if config.surface_bias_mode in {"forest", "snow"}:
+        return float(config.surface_bias_m)
+    if config.surface_bias_mode == "mask":
+        if mask_dataset is None or mask_data is None:
+            return 0.0
+        mask_value = sample_dem_bilinear(mask_dataset, mask_data, lat, lon)
+        return float(config.surface_bias_m if mask_value > 0.5 else 0.0)
+    raise ValueError(f"Unsupported surface_bias_mode: {config.surface_bias_mode}")
+
+
+def apply_sensor_model(
+    *,
+    dataset: rasterio.io.DatasetReader,
+    data: np.ndarray,
+    lat: float,
+    lon: float,
+    alt_msl: float,
+    terrain_h: float,
+    config: SimulationConfig,
+    rng: np.random.Generator,
+    bank_angle_deg: float,
+    mask_dataset: rasterio.io.DatasetReader | None = None,
+    mask_data: np.ndarray | None = None,
+) -> float:
+    """Apply optional realistic radar-altimeter effects on top of the true terrain."""
+
+    true_agl = alt_msl - terrain_h
+    if not config.realistic:
+        return float(true_agl + rng.normal(0.0, config.noise_sigma_m))
+
+    beam_radius_m = max(true_agl, 0.0) * math.tan(math.radians(config.beam_width_deg) * 0.5)
+    beam_terrain_h, terrain_samples = _sample_disc_terrain(
+        dataset=dataset,
+        data=data,
+        lat=lat,
+        lon=lon,
+        radius_m=beam_radius_m,
+        aggregation=config.beam_aggregation,
+    )
+    surface_bias_m = _surface_bias_at(
+        config=config,
+        dataset=dataset,
+        data=data,
+        lat=lat,
+        lon=lon,
+        terrain_samples=terrain_samples,
+        mask_dataset=mask_dataset,
+        mask_data=mask_data,
+    )
+    measured_agl = alt_msl - (beam_terrain_h + surface_bias_m)
+    cos_term = math.cos(math.radians(bank_angle_deg))
+    if abs(cos_term) > 1e-6:
+        measured_agl = measured_agl / cos_term
+
+    noise_sigma = config.noise_sigma_m
+    if _is_water_like(terrain_samples):
+        noise_sigma += config.water_multipath_extra_sigma_m
+    measured_agl += float(rng.normal(0.0, noise_sigma))
+
+    if config.spike_prob > 0.0 and float(rng.random()) < config.spike_prob:
+        measured_agl += float(rng.normal(0.0, config.spike_sigma_m))
+
+    if config.dropout_prob > 0.0 and float(rng.random()) < config.dropout_prob:
+        return float("nan")
+
+    return float(measured_agl)
+
+
 def iter_points(
     dataset: rasterio.io.DatasetReader,
     data: np.ndarray,
@@ -245,8 +400,10 @@ def iter_points(
     start_lat: float,
     start_lon: float,
     frequency_hz: float,
-    noise_sigma_m: float,
+    config: SimulationConfig,
     rng: np.random.Generator,
+    mask_dataset: rasterio.io.DatasetReader | None = None,
+    mask_data: np.ndarray | None = None,
 ) -> Iterator[TrajectoryPoint]:
     """Yield simulated route samples for the given segments."""
 
@@ -259,10 +416,11 @@ def iter_points(
     current_time_s = 0.0
     index = 0
 
-    for segment in segments:
+    for segment_index, segment in enumerate(segments):
         nominal_step_distance_m = segment.speed_mps * step_time_s
         num_steps = max(1, int(round(segment.distance_m / nominal_step_distance_m)))
         step_distance_m = segment.distance_m / num_steps
+        bank_angle_deg = _segment_bank_angle_deg(segments, segment_index)
 
         for step_idx in range(num_steps):
             if index == 0 and step_idx == 0:
@@ -279,7 +437,19 @@ def iter_points(
                 + (segment.altitude_end_m - segment.altitude_start_m) * progress
             )
             terrain_h = sample_dem_bilinear(dataset, data, lat, lon)
-            radar_alt = alt_msl - terrain_h + float(rng.normal(0.0, noise_sigma_m))
+            radar_alt = apply_sensor_model(
+                dataset=dataset,
+                data=data,
+                lat=lat,
+                lon=lon,
+                alt_msl=alt_msl,
+                terrain_h=terrain_h,
+                config=config,
+                rng=rng,
+                bank_angle_deg=bank_angle_deg,
+                mask_dataset=mask_dataset,
+                mask_data=mask_data,
+            )
 
             yield TrajectoryPoint(
                 index=index,
@@ -306,18 +476,31 @@ def generate_points(config: SimulationConfig) -> list[TrajectoryPoint]:
             data[np.isclose(data, float(dataset.nodata))] = np.nan
         segments = build_segments(config)
         LOGGER.info("Generating %d segment(s) at %.2f Hz", len(segments), config.frequency_hz)
-        return list(
-            iter_points(
-                dataset=dataset,
-                data=data,
-                segments=segments,
-                start_lat=config.start_lat,
-                start_lon=config.start_lon,
-                frequency_hz=config.frequency_hz,
-                noise_sigma_m=config.noise_sigma_m,
-                rng=rng,
+        mask_dataset = None
+        mask_data = None
+        if config.surface_mask is not None:
+            mask_dataset = rasterio.open(config.surface_mask)
+            mask_data = mask_dataset.read(1, out_dtype="float64").copy()
+            if mask_dataset.nodata is not None:
+                mask_data[np.isclose(mask_data, float(mask_dataset.nodata))] = 0.0
+        try:
+            return list(
+                iter_points(
+                    dataset=dataset,
+                    data=data,
+                    segments=segments,
+                    start_lat=config.start_lat,
+                    start_lon=config.start_lon,
+                    frequency_hz=config.frequency_hz,
+                    config=config,
+                    rng=rng,
+                    mask_dataset=mask_dataset,
+                    mask_data=mask_data,
+                )
             )
-        )
+        finally:
+            if mask_dataset is not None:
+                mask_dataset.close()
 
 
 def write_nmea_file(points: Iterable[TrajectoryPoint], output_path: Path) -> None:
@@ -362,6 +545,100 @@ def write_csv(points: Iterable[TrajectoryPoint], output_path: Path) -> None:
     LOGGER.info("Wrote ground-truth CSV to %s", output_path)
 
 
+def generate_imu_points(points: Sequence[TrajectoryPoint]) -> list[SyntheticImuPoint]:
+    """Generate a simple level-flight IMU stream from trajectory samples."""
+
+    if not points:
+        return []
+
+    imu_points: list[SyntheticImuPoint] = []
+    velocities = []
+    headings = []
+    for index, point in enumerate(points):
+        if index == 0:
+            velocities.append(np.zeros(2, dtype=float))
+            headings.append(0.0)
+            continue
+        prev = points[index - 1]
+        dt = max(point.timestamp_s - prev.timestamp_s, 1e-6)
+        azimuth_deg, _, distance_m = WGS84_GEOD.inv(prev.lon, prev.lat, point.lon, point.lat)
+        speed_mps = distance_m / dt
+        azimuth_rad = math.radians(float(azimuth_deg) % 360.0)
+        velocities.append(np.array([speed_mps * math.sin(azimuth_rad), speed_mps * math.cos(azimuth_rad)], dtype=float))
+        headings.append(float(azimuth_rad))
+    velocities[0] = velocities[1].copy() if len(velocities) > 1 else np.zeros(2, dtype=float)
+    headings[0] = headings[1] if len(headings) > 1 else 0.0
+
+    for index, point in enumerate(points):
+        if index == 0:
+            dt = max(points[1].timestamp_s - point.timestamp_s, 1e-6) if len(points) > 1 else 1.0
+            velocity_prev = velocities[0]
+            heading_prev = headings[0]
+        else:
+            dt = max(point.timestamp_s - points[index - 1].timestamp_s, 1e-6)
+            velocity_prev = velocities[index - 1]
+            heading_prev = headings[index - 1]
+        velocity = velocities[index]
+        accel_enu = np.array([(velocity[0] - velocity_prev[0]) / dt, (velocity[1] - velocity_prev[1]) / dt, 0.0], dtype=float)
+        heading = headings[index]
+        rotation = np.array(
+            [
+                [math.sin(heading), math.cos(heading), 0.0],
+                [-math.cos(heading), math.sin(heading), 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
+        specific_force_body = rotation @ (accel_enu - np.array([0.0, 0.0, -9.80665], dtype=float))
+        yaw_rate = ((heading - heading_prev + math.pi) % (2.0 * math.pi)) - math.pi
+        yaw_rate /= max(dt, 1e-6)
+        imu_points.append(
+            SyntheticImuPoint(
+                timestamp_s=point.timestamp_s,
+                accel_x_mps2=float(specific_force_body[0]),
+                accel_y_mps2=float(specific_force_body[1]),
+                accel_z_mps2=float(specific_force_body[2]),
+                gyro_x_rps=0.0,
+                gyro_y_rps=0.0,
+                gyro_z_rps=float(yaw_rate),
+            )
+        )
+    return imu_points
+
+
+def write_imu_csv(points: Sequence[TrajectoryPoint], output_path: Path) -> None:
+    """Write a synthetic IMU CSV synchronized to the generated trajectory."""
+
+    imu_points = generate_imu_points(points)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "timestamp_s",
+                "accel_x_mps2",
+                "accel_y_mps2",
+                "accel_z_mps2",
+                "gyro_x_rps",
+                "gyro_y_rps",
+                "gyro_z_rps",
+            ]
+        )
+        for point in imu_points:
+            writer.writerow(
+                [
+                    f"{point.timestamp_s:.3f}",
+                    f"{point.accel_x_mps2:.6f}",
+                    f"{point.accel_y_mps2:.6f}",
+                    f"{point.accel_z_mps2:.6f}",
+                    f"{point.gyro_x_rps:.6f}",
+                    f"{point.gyro_y_rps:.6f}",
+                    f"{point.gyro_z_rps:.6f}",
+                ]
+            )
+    LOGGER.info("Wrote IMU CSV to %s", output_path)
+
+
 def stream_udp(points: Iterable[TrajectoryPoint], host: str, port: int) -> None:
     """Send generated NMEA sentences to a UDP socket."""
 
@@ -385,9 +662,20 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--length-km", type=float, help="Custom route length in kilometers")
     parser.add_argument("--freq", type=float, default=5.0, help="NMEA output frequency in Hz")
     parser.add_argument("--noise", type=float, default=2.0, help="Radar altimeter Gaussian noise sigma in meters")
+    parser.add_argument("--realistic", action="store_true", help="Enable realistic radar-altimeter error model")
+    parser.add_argument("--beam-width-deg", type=float, default=0.0, help="Beam width in degrees for footprint smearing")
+    parser.add_argument("--beam-aggregation", choices=("mean", "min"), default="mean", help="Footprint aggregation mode")
+    parser.add_argument("--spike-prob", type=float, default=0.0, help="Probability of gross outlier per sample")
+    parser.add_argument("--spike-sigma", type=float, default=50.0, help="Sigma of gross outlier noise in meters")
+    parser.add_argument("--dropout-prob", type=float, default=0.0, help="Probability of missing radar-altimeter sample")
+    parser.add_argument("--water-multipath-extra-sigma", type=float, default=0.0, help="Extra sigma over water-like surfaces")
+    parser.add_argument("--surface-bias-mode", choices=("none", "forest", "snow", "mask"), default="none", help="Surface bias mode for canopy/snow effects")
+    parser.add_argument("--surface-bias-m", type=float, default=0.0, help="Surface bias in meters added above bare-earth DEM")
+    parser.add_argument("--surface-mask", type=Path, help="Optional raster mask for --surface-bias-mode mask")
     parser.add_argument("--output", choices=("file", "udp"), default="file", help="Output mode")
     parser.add_argument("--out-nmea", type=Path, help="Path to the .nmea output file")
     parser.add_argument("--out-csv", type=Path, help="Path to the ground-truth CSV output")
+    parser.add_argument("--out-imu", type=Path, help="Path to the synthetic IMU CSV output")
     parser.add_argument("--udp-host", default="127.0.0.1", help="UDP host for --output udp")
     parser.add_argument("--udp-port", type=int, default=10110, help="UDP port for --output udp")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for noise reproducibility")
@@ -417,6 +705,7 @@ def parse_args(argv: Sequence[str] | None = None) -> SimulationConfig:
         output_mode=args.output,
         out_nmea=args.out_nmea,
         out_csv=args.out_csv,
+        out_imu=args.out_imu,
         udp_host=args.udp_host,
         udp_port=args.udp_port,
         random_seed=args.seed,
@@ -426,6 +715,16 @@ def parse_args(argv: Sequence[str] | None = None) -> SimulationConfig:
         duration_s=args.duration_s,
         length_km=args.length_km,
         trajectory_id=args.trajectory,
+        beam_width_deg=args.beam_width_deg,
+        beam_aggregation=args.beam_aggregation,
+        spike_prob=args.spike_prob,
+        spike_sigma_m=args.spike_sigma,
+        dropout_prob=args.dropout_prob,
+        water_multipath_extra_sigma_m=args.water_multipath_extra_sigma,
+        realistic=bool(args.realistic),
+        surface_bias_mode=args.surface_bias_mode,
+        surface_bias_m=args.surface_bias_m,
+        surface_mask=args.surface_mask,
     )
 
 
@@ -446,6 +745,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     points = generate_points(config)
     if config.out_csv is not None:
         write_csv(points, config.out_csv)
+    if config.out_imu is not None:
+        write_imu_csv(points, config.out_imu)
     if config.output_mode == "file":
         if config.out_nmea is None:
             raise ValueError("out_nmea must be provided in file mode")

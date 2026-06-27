@@ -7,6 +7,7 @@ import rasterio
 from rasterio.io import MemoryFile
 from rasterio.transform import from_origin
 
+import dem_loader
 from dem_loader import DEMLoader
 
 
@@ -56,6 +57,57 @@ def test_get_profile_along_azimuth_returns_1d_profile() -> None:
     assert profile.ndim == 1
     assert profile.shape == (5,)
     assert np.all(np.diff(profile) > 0)
+
+
+def test_sample_points_matches_scalar_sampling_for_multiple_points() -> None:
+    memfile = _build_memory_dem()
+    try:
+        with DEMLoader(memfile.name) as dem:
+            lats = np.array([49.505, 49.495, 49.485], dtype=float)
+            lons = np.array([10.505, 10.515, 10.525], dtype=float)
+
+            batch_values = dem._sample_points(lats, lons)
+            scalar_values = np.array(
+                [dem.get_elevation(lat, lon) for lat, lon in zip(lats, lons)],
+                dtype=float,
+            )
+    finally:
+        memfile.close()
+
+    assert batch_values.shape == (3,)
+    assert np.allclose(batch_values, scalar_values, atol=1e-6, equal_nan=True)
+
+
+def test_get_profile_along_azimuth_matches_batch_sampling() -> None:
+    memfile = _build_memory_dem()
+    try:
+        with DEMLoader(memfile.name) as dem:
+            distance_m = 1000.0
+            step_m = 250.0
+            steps = int(distance_m / step_m) + 1
+            distances = np.linspace(0.0, distance_m, steps)
+            lons, lats, _ = dem_loader.WGS84_GEOD.fwd(
+                np.full(steps, 10.5, dtype=float),
+                np.full(steps, 49.5, dtype=float),
+                np.full(steps, 90.0, dtype=float),
+                distances,
+            )
+
+            profile = dem.get_profile_along_azimuth(
+                lat=49.5,
+                lon=10.5,
+                azimuth_deg=90.0,
+                distance_m=distance_m,
+                step_m=step_m,
+            )
+            batch_values = dem._sample_points(
+                np.asarray(lats, dtype=float),
+                np.asarray(lons, dtype=float),
+            )
+    finally:
+        memfile.close()
+
+    assert np.allclose(profile, batch_values, atol=1e-6, equal_nan=True)
 
 
 def test_get_patch_returns_array_and_transform() -> None:

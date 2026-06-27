@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from typing import List
 
 import numpy as np
-import pyproj
 
+from local_frame import LocalFrame
 from position_solver import PositionEstimate, normalize_azimuth_deg
 
 
@@ -137,9 +137,7 @@ class IMMFilter:
         )
         self.models: List[KalmanModel] = [HoverModel(), CruiseModel(), TurnModel()]
         self.weights = np.array([0.2, 0.6, 0.2], dtype=float)
-        self._origin_lat: float | None = None
-        self._origin_lon: float | None = None
-        self._geod = pyproj.Geod(ellps="WGS84")
+        self._frame: LocalFrame | None = None
         self._last_fix: PositionEstimate | None = None
         self._last_result: IMMResult | None = None
 
@@ -255,11 +253,17 @@ class IMMFilter:
     ) -> np.ndarray:
         """Build measurement covariance in the local meter frame."""
 
-        sigma_pos = float(math.sqrt(max(np.mean(np.diag(position_fix.cov_matrix)), 1.0)))
+        pos_cov = np.asarray(position_fix.cov_matrix, dtype=float).copy()
+        if pos_cov.shape != (2, 2):
+            raise ValueError("position_fix.cov_matrix must be 2x2")
         if is_flat:
-            sigma_pos *= 10.0
+            pos_cov *= 100.0
         sigma_vel = max(position_fix.speed_mps * 0.15, 2.0)
-        return np.diag([sigma_pos**2, sigma_pos**2, sigma_vel**2, sigma_vel**2]).astype(float)
+        measurement_cov = np.zeros((4, 4), dtype=float)
+        measurement_cov[:2, :2] = pos_cov
+        measurement_cov[2, 2] = sigma_vel**2
+        measurement_cov[3, 3] = sigma_vel**2
+        return measurement_cov
 
     def _model_compatibility(self, position_fix: PositionEstimate, dt: float) -> np.ndarray:
         """Estimate how well the measurement matches each motion mode."""
@@ -294,19 +298,12 @@ class IMMFilter:
     def _fix_to_measurement(self, position_fix: PositionEstimate) -> np.ndarray:
         """Convert geodetic fix into local-meter position and velocity."""
 
-        if self._origin_lat is None or self._origin_lon is None:
-            self._origin_lat = position_fix.lat
-            self._origin_lon = position_fix.lon
+        if self._frame is None:
+            self._frame = LocalFrame(position_fix.lat, position_fix.lon)
 
-        azimuth_fwd, _, distance_m = self._geod.inv(
-            self._origin_lon,
-            self._origin_lat,
-            position_fix.lon,
-            position_fix.lat,
-        )
-        azimuth_rad = math.radians(normalize_azimuth_deg(azimuth_fwd))
-        x_m = distance_m * math.sin(azimuth_rad)
-        y_m = distance_m * math.cos(azimuth_rad)
+        enu = self._frame.to_enu(position_fix.lat, position_fix.lon)
+        x_m = float(enu[0])
+        y_m = float(enu[1])
 
         motion_rad = math.radians(normalize_azimuth_deg(position_fix.azimuth_deg))
         vx = position_fix.speed_mps * math.sin(motion_rad)
@@ -316,15 +313,7 @@ class IMMFilter:
     def _xy_to_latlon(self, x_m: float, y_m: float) -> tuple[float, float]:
         """Convert local-meter coordinates back to latitude/longitude."""
 
-        if self._origin_lat is None or self._origin_lon is None:
+        if self._frame is None:
             raise RuntimeError("IMMFilter has not been initialized with a measurement")
-
-        distance_m = math.hypot(x_m, y_m)
-        azimuth_deg = normalize_azimuth_deg(math.degrees(math.atan2(x_m, y_m)))
-        lon, lat, _ = self._geod.fwd(
-            self._origin_lon,
-            self._origin_lat,
-            azimuth_deg,
-            distance_m,
-        )
+        lat, lon = self._frame.to_geodetic(np.array([x_m, y_m], dtype=float))
         return float(lat), float(lon)
