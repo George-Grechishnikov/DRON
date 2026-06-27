@@ -691,18 +691,19 @@ def maybe_update_heading_from_correlation(
 
     target_azimuth_deg = _wrap_angle_deg(corr_result.best_azimuth_deg)
     if corr_result.is_ambiguous:
+        max_heading_candidate_offset_m = min(max_trusted_offset_m, 150.0)
         low_offset_candidates = [
             candidate
             for candidate in corr_result.top_candidates
             if np.isfinite(candidate.azimuth_deg)
             and np.isfinite(candidate.offset_subsample_m)
-            and abs(candidate.offset_subsample_m) <= max_trusted_offset_m
+            and abs(candidate.offset_subsample_m) <= max_heading_candidate_offset_m
             and candidate.score >= corr_result.peak_correlation - 0.10
         ]
         if low_offset_candidates and corr_result.peak_correlation >= 0.92:
             heading_candidate = max(low_offset_candidates, key=lambda item: item.score)
             delta_deg = _angle_delta_deg(current_azimuth_deg, heading_candidate.azimuth_deg)
-            if abs(delta_deg) < 12.0:
+            if abs(delta_deg) < 20.0:
                 return _wrap_angle_deg(current_azimuth_deg)
             max_turn_deg = 8.0 if selected_window_size >= 30 else 12.0
             delta_deg = float(np.clip(delta_deg, -max_turn_deg, max_turn_deg))
@@ -1171,6 +1172,7 @@ def choose_navigation_fix(
         and np.isfinite(matched_offset)
         and abs(matched_offset) <= 30.0
         and corr_result.peak_correlation >= 0.95
+        and abs(_angle_delta_deg(current_azimuth, corr_result.best_azimuth_deg)) >= 5.0
     ):
         hinted_azimuth = _wrap_angle_deg(corr_result.best_azimuth_deg)
 
@@ -1898,6 +1900,9 @@ def pipeline_worker(
                         distance_m=skipped_intervals * measurement_step_m,
                         geod=geod,
                     )
+                prediction_start_lat = solve_start_lat
+                prediction_start_lon = solve_start_lon
+                fallback_corr_result = selection.corr_result
 
                 frames_window = [item.frame for item in active_frame_packets]
                 terrain_profile = frames_to_terrain_profile(
@@ -1948,12 +1953,12 @@ def pipeline_worker(
                 if hold_reacquisition:
                     nav_decision = build_prediction_navigation_decision(
                         mode="terrain_reacquire_wait",
-                        current_lat=window_start_lat,
-                        current_lon=window_start_lon,
+                        current_lat=prediction_start_lat,
+                        current_lon=prediction_start_lon,
                         current_speed=current_speed,
                         current_azimuth=current_azimuth,
                         window_duration=window_duration,
-                        corr_result=corr_result,
+                        corr_result=fallback_corr_result,
                         selected_window_size=active_window_size,
                         measurement_span_m=measurement_span_m,
                         max_offset_m=config.max_offset_m,
@@ -1980,6 +1985,22 @@ def pipeline_worker(
                         selected_window_size=active_window_size,
                         max_offset_m=config.max_offset_m,
                     )
+                    if nav_decision.used_prediction_only and (
+                        abs(solve_start_lat - prediction_start_lat) > 1e-12
+                        or abs(solve_start_lon - prediction_start_lon) > 1e-12
+                    ):
+                        nav_decision = build_prediction_navigation_decision(
+                            mode=nav_decision.mode,
+                            current_lat=prediction_start_lat,
+                            current_lon=prediction_start_lon,
+                            current_speed=current_speed,
+                            current_azimuth=current_azimuth,
+                            window_duration=window_duration,
+                            corr_result=fallback_corr_result,
+                            selected_window_size=active_window_size,
+                            measurement_span_m=measurement_span_m,
+                            max_offset_m=config.max_offset_m,
+                        )
                     position_fix = nav_decision.fix
                     if nav_decision.corr_result is not None:
                         corr_result = nav_decision.corr_result

@@ -661,6 +661,42 @@ def test_ambiguous_top_k_low_offset_candidate_can_softly_update_heading() -> Non
     assert hinted == 9.5
 
 
+def test_ambiguous_heading_candidate_with_large_offset_is_ignored() -> None:
+    corr = _corr(is_ambiguous=True, confidence=0.05, peak_correlation=0.94)
+    candidate = CorrelationCandidate(
+        azimuth_deg=69.5,
+        offset_steps=39,
+        offset_m=390.0,
+        offset_subsample_steps=38.6,
+        offset_subsample_m=386.2,
+        score=0.939,
+        ncc_score=0.939,
+        msd_score=0.939,
+    )
+    corr = CorrelationResult(
+        **{
+            **corr.__dict__,
+            "best_azimuth_deg": 69.5,
+            "best_offset_m": 386.2,
+            "best_offset_subsample_m": 386.2,
+            "top_candidates": (candidate,),
+            "pslr_db": 0.08,
+            "ambiguity_peak_count": 10,
+        }
+    )
+
+    hinted = maybe_update_heading_from_correlation(
+        current_azimuth_deg=45.0,
+        corr_result=corr,
+        max_offset_m=2000.0,
+        selected_window_size=20,
+        measurement_step_m=10.0,
+        used_prediction_only=True,
+    )
+
+    assert hinted == 45.0
+
+
 def test_prediction_heading_cue_updates_next_motion_state() -> None:
     corr = _corr(
         is_reliable=False,
