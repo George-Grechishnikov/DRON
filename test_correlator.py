@@ -119,6 +119,20 @@ def test_compute_returns_ambiguity_metrics() -> None:
     assert isinstance(result.is_ambiguous, bool)
 
 
+def test_compute_returns_top_correlation_candidates() -> None:
+    azimuths = np.arange(16, dtype=float)
+    ref_matrix = _make_reference_matrix(16, 40, 8)
+    h_meas = ref_matrix[3, 4:44]
+    correlator = Correlator(profile_length_m=1200.0, step_m=30.0, max_offset_m=240.0)
+
+    result = correlator.compute(h_meas, ref_matrix, azimuths_deg=azimuths)
+
+    assert len(result.top_candidates) > 0
+    assert np.isclose(result.top_candidates[0].azimuth_deg, result.best_azimuth_deg, atol=0.5)
+    assert result.top_candidates[0].offset_steps == result.best_offset_steps
+    assert result.top_candidates[0].score == result.peak_correlation
+
+
 def test_compute_ambiguity_uses_two_dimensional_peak_geometry() -> None:
     heatmap = np.zeros((360, 32), dtype=float)
     heatmap[20, 8] = 1.0

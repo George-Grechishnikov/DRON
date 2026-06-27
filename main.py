@@ -11,19 +11,19 @@ import signal
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, List
 
 import numpy as np
 import pyproj
 
-from correlator import Correlator, CorrelationResult, ObservabilityMetrics, compute_observability_metrics
+from correlator import CorrelationCandidate, Correlator, CorrelationResult, ObservabilityMetrics, compute_observability_metrics
 from constants import FIXED_BARO_ALTITUDE_M
 from dem_loader import DEMLoader
 from eskf import ESKF, ImuSample
 from imm_filter import IMMFilter, IMMResult
-from measurement_layer import BaroTrack, frames_to_terrain_profile, update_terrain_bias
+from measurement_layer import BaroTrack, frames_to_terrain_profile, parse_nmea_timestamp_to_seconds, update_terrain_bias
 from nmea_parser import NMEAFrame, NMEAReader, parse_line
 from position_solver import PositionEstimate, PositionSolver
 from profile_extractor import ProfileExtractor, is_flat_terrain
@@ -118,6 +118,7 @@ class NavigationDecision:
     fix: PositionEstimate
     mode: str
     used_prediction_only: bool
+    corr_result: CorrelationResult | None = None
 
 
 @dataclass(frozen=True)
@@ -644,6 +645,25 @@ def matched_offset_m(corr_result: CorrelationResult) -> float:
     )
 
 
+def correlation_result_from_candidate(
+    corr_result: CorrelationResult,
+    candidate: CorrelationCandidate,
+) -> CorrelationResult:
+    """Return a correlation result whose primary peak is a selected top-k candidate."""
+
+    return replace(
+        corr_result,
+        best_azimuth_deg=float(candidate.azimuth_deg),
+        best_offset_steps=int(candidate.offset_steps),
+        best_offset_m=float(candidate.offset_m),
+        best_offset_subsample_steps=float(candidate.offset_subsample_steps),
+        best_offset_subsample_m=float(candidate.offset_subsample_m),
+        peak_correlation=float(candidate.score),
+        ncc_peak=float(candidate.ncc_score),
+        msd_peak=float(candidate.msd_score),
+    )
+
+
 def maybe_update_heading_from_correlation(
     *,
     current_azimuth_deg: float,
@@ -671,6 +691,23 @@ def maybe_update_heading_from_correlation(
 
     target_azimuth_deg = _wrap_angle_deg(corr_result.best_azimuth_deg)
     if corr_result.is_ambiguous:
+        low_offset_candidates = [
+            candidate
+            for candidate in corr_result.top_candidates
+            if np.isfinite(candidate.azimuth_deg)
+            and np.isfinite(candidate.offset_subsample_m)
+            and abs(candidate.offset_subsample_m) <= max_trusted_offset_m
+            and candidate.score >= corr_result.peak_correlation - 0.10
+        ]
+        if low_offset_candidates and corr_result.peak_correlation >= 0.92:
+            heading_candidate = max(low_offset_candidates, key=lambda item: item.score)
+            delta_deg = _angle_delta_deg(current_azimuth_deg, heading_candidate.azimuth_deg)
+            if abs(delta_deg) < 12.0:
+                return _wrap_angle_deg(current_azimuth_deg)
+            max_turn_deg = 8.0 if selected_window_size >= 30 else 12.0
+            delta_deg = float(np.clip(delta_deg, -max_turn_deg, max_turn_deg))
+            if abs(delta_deg) >= 1.0:
+                return _wrap_angle_deg(current_azimuth_deg + delta_deg)
         # During a turn transition we can keep the predicted track alive, but we
         # should not rotate aggressively when correlation peaks are not separated.
         if (
@@ -726,6 +763,7 @@ def build_prediction_navigation_decision(
         ),
         mode=mode,
         used_prediction_only=True,
+        corr_result=corr_result,
     )
 
 
@@ -897,6 +935,24 @@ def build_path_offsets_enu(
     )
     times = np.arange(sample_count, dtype=float) * float(sample_dt)
     return times[:, np.newaxis] * velocity_xy[np.newaxis, :]
+
+
+def estimate_window_duration_s(frame_packets: list[FramePacket], fallback_freq_hz: float) -> float:
+    """Estimate window duration from NMEA timestamps with a fixed-frequency fallback."""
+
+    if len(frame_packets) < 2:
+        return 0.0
+    fallback_duration = (len(frame_packets) - 1) / max(float(fallback_freq_hz), 1e-6)
+    start_s = parse_nmea_timestamp_to_seconds(frame_packets[0].frame.timestamp_utc)
+    end_s = parse_nmea_timestamp_to_seconds(frame_packets[-1].frame.timestamp_utc)
+    if not (np.isfinite(start_s) and np.isfinite(end_s)):
+        return float(fallback_duration)
+    if end_s < start_s:
+        end_s += 24.0 * 3600.0
+    duration_s = float(end_s - start_s)
+    if duration_s <= 0.0 or duration_s > max(fallback_duration * 3.0, fallback_duration + 5.0):
+        return float(fallback_duration)
+    return duration_s
 
 
 def advance_geodetic_point(
@@ -1179,25 +1235,48 @@ def choose_navigation_fix(
             heading_override_deg=hinted_azimuth,
         )
 
+    selected_corr_result = corr_result
     if hasattr(solver, "get_track") and hasattr(solver, "solve_with_velocity"):
         solver_track = solver.get_track()
         previous_fix = solver_track[-1] if solver_track else None
-        candidate_fix = solver.solve_with_velocity(
-            result=corr_result,
-            start_lat=window_start_lat,
-            start_lon=window_start_lon,
-            window_duration_s=window_duration,
-            update_dt_s=update_dt,
-            measurement_span_m=measurement_span_m,
-            prev_fix=previous_fix,
-        )
-        plausibility_reason = terrain_fix_plausibility_reason(
-            candidate_fix=candidate_fix,
-            previous_fix=previous_fix,
-            current_speed=current_speed,
-            current_azimuth=current_azimuth,
-            update_dt=update_dt,
-        )
+        candidate_results = [corr_result]
+        best_score = float(corr_result.peak_correlation)
+        seen_candidates = {
+            (round(corr_result.best_azimuth_deg, 6), round(matched_offset_m(corr_result), 6))
+        }
+        for candidate in corr_result.top_candidates:
+            if candidate.score < best_score - 0.08:
+                continue
+            key = (round(candidate.azimuth_deg, 6), round(candidate.offset_subsample_m, 6))
+            if key in seen_candidates:
+                continue
+            seen_candidates.add(key)
+            candidate_results.append(correlation_result_from_candidate(corr_result, candidate))
+
+        plausibility_reason = None
+        selected_candidate_index = 0
+        for candidate_index, candidate_corr_result in enumerate(candidate_results):
+            candidate_fix = solver.solve_with_velocity(
+                result=candidate_corr_result,
+                start_lat=window_start_lat,
+                start_lon=window_start_lon,
+                window_duration_s=window_duration,
+                update_dt_s=update_dt,
+                measurement_span_m=measurement_span_m,
+                prev_fix=previous_fix,
+            )
+            plausibility_reason = terrain_fix_plausibility_reason(
+                candidate_fix=candidate_fix,
+                previous_fix=previous_fix,
+                current_speed=current_speed,
+                current_azimuth=current_azimuth,
+                update_dt=update_dt,
+            )
+            if plausibility_reason is None:
+                selected_corr_result = candidate_corr_result
+                selected_candidate_index = candidate_index
+                break
+
         if plausibility_reason is not None:
             LOGGER.warning("Terrain fix rejected by physical gate: %s", plausibility_reason)
             return build_prediction_navigation_decision(
@@ -1213,10 +1292,18 @@ def choose_navigation_fix(
                 max_offset_m=max_offset_m,
                 heading_override_deg=hinted_azimuth,
             )
+        if selected_candidate_index > 0:
+            LOGGER.info(
+                "Terrain top-k candidate accepted after physical gate: index=%d azimuth=%.1f offset=%.1fm score=%.3f",
+                selected_candidate_index,
+                selected_corr_result.best_azimuth_deg,
+                matched_offset_m(selected_corr_result),
+                selected_corr_result.peak_correlation,
+            )
 
     return NavigationDecision(
         fix=solver.solve(
-            result=corr_result,
+            result=selected_corr_result,
             start_lat=window_start_lat,
             start_lon=window_start_lon,
             window_duration_s=window_duration,
@@ -1225,6 +1312,7 @@ def choose_navigation_fix(
         ),
         mode="terrain_update_accepted",
         used_prediction_only=False,
+        corr_result=selected_corr_result,
     )
 
 
@@ -1819,8 +1907,8 @@ def pipeline_worker(
                 )
                 h_meas = terrain_profile.values_m
                 flat = is_flat_terrain(h_meas, threshold_m=config.flat_terrain_threshold_m)
-                window_duration = max(active_window_size - 1, 0) / config.freq_hz
-                measurement_span_m = max(active_window_size - 1, 0) * measurement_step_m
+                window_duration = estimate_window_duration_s(active_frame_packets, config.freq_hz)
+                measurement_span_m = max(current_speed, 0.0) * window_duration
 
                 if reacquisition_tracker.pending:
                     local_reacquisition = local_reacquisition_search(
@@ -1871,6 +1959,8 @@ def pipeline_worker(
                         max_offset_m=config.max_offset_m,
                     )
                     position_fix = nav_decision.fix
+                    if nav_decision.corr_result is not None:
+                        corr_result = nav_decision.corr_result
                     degraded = True
                 else:
                     nav_decision = choose_navigation_fix(
@@ -1891,6 +1981,8 @@ def pipeline_worker(
                         max_offset_m=config.max_offset_m,
                     )
                     position_fix = nav_decision.fix
+                    if nav_decision.corr_result is not None:
+                        corr_result = nav_decision.corr_result
                     degraded = nav_decision.used_prediction_only or (not corr_result.informative)
                     if (
                         not nav_decision.used_prediction_only
@@ -1942,8 +2034,8 @@ def pipeline_worker(
                     efficiency_hint=0.0,
                     is_informative=False,
                 )
-                window_duration = max(selection_window_size - 1, 0) / config.freq_hz
-                measurement_span_m = max(selection_window_size - 1, 0) * measurement_step_m
+                window_duration = estimate_window_duration_s(frame_packets, config.freq_hz)
+                measurement_span_m = max(current_speed, 0.0) * window_duration
                 nav_decision = NavigationDecision(
                     fix=predict_fix(
                         current_lat=window_start_lat,

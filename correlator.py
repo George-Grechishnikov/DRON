@@ -24,6 +24,20 @@ MIN_PROFILE_STD_M = 1e-6
 
 
 @dataclass(frozen=True)
+class CorrelationCandidate:
+    """One local maximum from the azimuth/offset correlation heatmap."""
+
+    azimuth_deg: float
+    offset_steps: int
+    offset_m: float
+    offset_subsample_steps: float
+    offset_subsample_m: float
+    score: float
+    ncc_score: float
+    msd_score: float
+
+
+@dataclass(frozen=True)
 class CorrelationResult:
     """Correlation search result."""
 
@@ -49,6 +63,7 @@ class CorrelationResult:
     heatmap: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=float))
     azimuths_deg: np.ndarray = field(default_factory=lambda: np.empty((0,), dtype=float))
     best_reference_profile: np.ndarray = field(default_factory=lambda: np.empty((0,), dtype=float))
+    top_candidates: tuple[CorrelationCandidate, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -285,6 +300,13 @@ class Correlator:
         peak = float(heatmap[best_row, best_col])
         ncc_peak = float(ncc_heatmap[best_row, best_col])
         msd_peak = float(msd_heatmap[best_row, best_col])
+        top_candidates = self._extract_top_candidates(
+            heatmap=heatmap,
+            ncc_heatmap=ncc_heatmap,
+            msd_heatmap=msd_heatmap,
+            azimuth_axis=azimuth_axis,
+            limit=8,
+        )
         confidence, peak_to_sidelobe, peak_to_mean = self._peak_quality(
             heatmap,
             best_row,
@@ -328,6 +350,7 @@ class Correlator:
             heatmap=heatmap,
             azimuths_deg=azimuth_axis.copy(),
             best_reference_profile=best_reference_profile,
+            top_candidates=top_candidates,
         )
 
     def sliding_window_compute(
@@ -477,6 +500,64 @@ class Correlator:
                 (1.0 - self.feature_refine_weight) * base_score
                 + self.feature_refine_weight * feature_score
             )
+
+    def _extract_top_candidates(
+        self,
+        *,
+        heatmap: np.ndarray,
+        ncc_heatmap: np.ndarray,
+        msd_heatmap: np.ndarray,
+        azimuth_axis: np.ndarray,
+        limit: int,
+    ) -> tuple[CorrelationCandidate, ...]:
+        """Return strongest local maxima for downstream multi-hypothesis gating."""
+
+        values = np.asarray(heatmap, dtype=float)
+        finite_mask = np.isfinite(values)
+        if values.ndim != 2 or values.size == 0 or not np.any(finite_mask) or limit <= 0:
+            return tuple()
+
+        sanitized = np.where(finite_mask, values, -np.inf)
+        local_max = sanitized == maximum_filter(
+            sanitized,
+            size=(5, 5),
+            mode=("wrap", "nearest"),
+        )
+        rows, cols = np.nonzero(local_max & finite_mask)
+        if rows.size == 0:
+            rows, cols = np.nonzero(finite_mask)
+
+        scores = sanitized[rows, cols]
+        order = np.argsort(scores)[::-1][:limit]
+        candidates: list[CorrelationCandidate] = []
+        seen: set[tuple[int, int]] = set()
+        for item_index in order:
+            row = int(rows[item_index])
+            col = int(cols[item_index])
+            key = (row, col)
+            if key in seen:
+                continue
+            seen.add(key)
+            offset_delta, _ = self._subsample_peak_1d(
+                values[row],
+                col,
+                cyclic=False,
+            )
+            azimuth_delta, _ = self._subsample_peak_2d_azimuth(values, row, col)
+            offset_subsample_steps = float(np.clip(col + offset_delta, 0.0, max(values.shape[1] - 1, 0)))
+            candidates.append(
+                CorrelationCandidate(
+                    azimuth_deg=float((azimuth_axis[row] + azimuth_delta) % 360.0),
+                    offset_steps=col,
+                    offset_m=float(col * self.step_m),
+                    offset_subsample_steps=offset_subsample_steps,
+                    offset_subsample_m=float(offset_subsample_steps * self.step_m),
+                    score=float(values[row, col]),
+                    ncc_score=float(ncc_heatmap[row, col]),
+                    msd_score=float(msd_heatmap[row, col]),
+                )
+            )
+        return tuple(candidates)
 
     @staticmethod
     def _ncc_scores(

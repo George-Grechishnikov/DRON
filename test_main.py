@@ -9,6 +9,7 @@ from constants import FIXED_BARO_ALTITUDE_M
 from imm_filter import IMMResult
 from main import (
     Config,
+    FramePacket,
     GroundTruthPoint,
     NavigationDecision,
     ReacquisitionTracker,
@@ -17,6 +18,7 @@ from main import (
     build_window_sizes,
     choose_navigation_fix,
     compute_replay_metrics,
+    estimate_window_duration_s,
     maybe_select_turn_transition_window,
     maybe_trim_turn_transition_tail,
     maybe_update_heading_from_correlation,
@@ -26,8 +28,9 @@ from main import (
     update_motion_state_after_decision,
 )
 from position_solver import PositionEstimate, PositionSolver
-from correlator import CorrelationResult, ObservabilityMetrics
+from correlator import CorrelationCandidate, CorrelationResult, ObservabilityMetrics
 from measurement_layer import BaroTrack
+from nmea_parser import NMEAFrame
 
 
 class StubSolver:
@@ -190,6 +193,44 @@ def test_build_window_sizes_expands_candidates_when_adaptive_is_enabled() -> Non
     sizes = build_window_sizes(config, available_frames=50)
 
     assert sizes == [20, 30, 40, 50]
+
+
+def test_estimate_window_duration_uses_nmea_timestamps() -> None:
+    packets = [
+        FramePacket(
+            index=0,
+            frame=NMEAFrame(timestamp_utc="123519.000", radar_alt_m=100.0, raw="", valid=True),
+        ),
+        FramePacket(
+            index=1,
+            frame=NMEAFrame(timestamp_utc="123521.500", radar_alt_m=100.0, raw="", valid=True),
+        ),
+    ]
+
+    duration_s = estimate_window_duration_s(packets, fallback_freq_hz=5.0)
+
+    assert duration_s == 2.5
+
+
+def test_estimate_window_duration_falls_back_for_invalid_timestamps() -> None:
+    packets = [
+        FramePacket(
+            index=0,
+            frame=NMEAFrame(timestamp_utc="", radar_alt_m=100.0, raw="", valid=True),
+        ),
+        FramePacket(
+            index=1,
+            frame=NMEAFrame(timestamp_utc="", radar_alt_m=100.0, raw="", valid=True),
+        ),
+        FramePacket(
+            index=2,
+            frame=NMEAFrame(timestamp_utc="", radar_alt_m=100.0, raw="", valid=True),
+        ),
+    ]
+
+    duration_s = estimate_window_duration_s(packets, fallback_freq_hz=4.0)
+
+    assert duration_s == 0.5
 
 
 def test_build_turn_probe_window_sizes_includes_short_tail() -> None:
@@ -420,7 +461,7 @@ def test_choose_navigation_fix_rejects_physically_implausible_jump() -> None:
         current_speed=50.0,
         current_azimuth=45.0,
         window_duration=10.0,
-        measurement_span_m=0.0,
+        measurement_span_m=100.0,
         update_dt=2.0,
         window_counter=5,
         flat=False,
@@ -429,6 +470,55 @@ def test_choose_navigation_fix_rejects_physically_implausible_jump() -> None:
 
     assert decision.used_prediction_only is True
     assert decision.mode.startswith("terrain_physical_gate_fallback")
+
+
+def test_choose_navigation_fix_accepts_plausible_top_k_alternative() -> None:
+    solver = PositionSolver()
+    solver.solve(
+        result=_corr(offset_m=0.0, azimuth_deg=45.0),
+        start_lat=60.5,
+        start_lon=90.3,
+        window_duration_s=10.0,
+        update_dt_s=2.0,
+        measurement_span_m=0.0,
+    )
+    primary = _corr(offset_m=2000.0, azimuth_deg=45.0, peak_correlation=0.9)
+    alternative = CorrelationCandidate(
+        azimuth_deg=45.0,
+        offset_steps=0,
+        offset_m=0.0,
+        offset_subsample_steps=0.0,
+        offset_subsample_m=0.0,
+        score=0.88,
+        ncc_score=0.88,
+        msd_score=0.88,
+    )
+    corr = CorrelationResult(
+        **{
+            **primary.__dict__,
+            "top_candidates": (alternative,),
+        }
+    )
+
+    decision = choose_navigation_fix(
+        config=_config(),
+        corr_result=corr,
+        solver=solver,
+        window_start_lat=60.5,
+        window_start_lon=90.3,
+        current_speed=50.0,
+        current_azimuth=45.0,
+        window_duration=10.0,
+        measurement_span_m=100.0,
+        update_dt=2.0,
+        window_counter=5,
+        flat=False,
+        observability=ObservabilityMetrics(crlb_m=50.0, gradient_energy=2.0, efficiency_hint=0.4, is_informative=True),
+    )
+
+    assert decision.used_prediction_only is False
+    assert decision.corr_result is not None
+    assert decision.corr_result.best_offset_m == 0.0
 
 
 def test_choose_navigation_fix_falls_back_when_terrain_is_ambiguous() -> None:
@@ -533,6 +623,42 @@ def test_ambiguous_turn_transition_keeps_prediction_heading_when_pslr_is_low() -
     )
 
     assert hinted == 45.0
+
+
+def test_ambiguous_top_k_low_offset_candidate_can_softly_update_heading() -> None:
+    corr = _corr(is_ambiguous=True, confidence=0.05, peak_correlation=0.94)
+    candidate = CorrelationCandidate(
+        azimuth_deg=45.0,
+        offset_steps=3,
+        offset_m=30.0,
+        offset_subsample_steps=3.0,
+        offset_subsample_m=30.0,
+        score=0.93,
+        ncc_score=0.88,
+        msd_score=0.88,
+    )
+    corr = CorrelationResult(
+        **{
+            **corr.__dict__,
+            "best_azimuth_deg": 20.0,
+            "best_offset_m": 0.0,
+            "best_offset_subsample_m": 0.0,
+            "top_candidates": (candidate,),
+            "pslr_db": 0.3,
+            "ambiguity_peak_count": 3,
+        }
+    )
+
+    hinted = maybe_update_heading_from_correlation(
+        current_azimuth_deg=1.5,
+        corr_result=corr,
+        max_offset_m=2000.0,
+        selected_window_size=50,
+        measurement_step_m=10.0,
+        used_prediction_only=True,
+    )
+
+    assert hinted == 9.5
 
 
 def test_prediction_heading_cue_updates_next_motion_state() -> None:
