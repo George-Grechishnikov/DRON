@@ -8,7 +8,14 @@ import numpy as np
 
 from correlator import CorrelationResult
 from imm_filter import IMMResult
-from visualizer import TerrainNavigatorDash, create_arrow_shape, export_demo_report, export_flight_report
+from visualizer import (
+    TerrainNavigatorDash,
+    build_operator_summary,
+    create_arrow_shape,
+    export_demo_report,
+    export_flight_report,
+    export_operator_outputs,
+)
 
 
 def _fake_corr() -> CorrelationResult:
@@ -194,3 +201,64 @@ def test_export_demo_report_writes_truth_and_gnss_status(tmp_path: Path) -> None
     contents = output_path.read_text(encoding="utf-8")
     assert "TERRAIN NAVIGATOR Demo Report" in contents
     assert "GNSS LOST" in contents
+
+    summary_txt = tmp_path / "demo_report.summary.txt"
+    summary_json = tmp_path / "demo_report.summary.json"
+    records_csv = tmp_path / "demo_report.records.csv"
+    assert summary_txt.exists()
+    assert summary_json.exists()
+    assert records_csv.exists()
+    assert "Status:" in summary_txt.read_text(encoding="utf-8")
+
+
+def test_build_operator_summary_marks_review_for_mid_quality_run() -> None:
+    summary = build_operator_summary(
+        [
+            {
+                "timestamp": 1.0,
+                "gnss_available": True,
+                "mode": "GNSS",
+                "truth_error_m": 120.0,
+                "correlation_peak": 0.80,
+            },
+            {
+                "timestamp": 2.0,
+                "gnss_available": False,
+                "mode": "TERRAIN_NAV",
+                "truth_error_m": 180.0,
+                "correlation_peak": 0.72,
+            },
+        ]
+    )
+
+    assert summary["status"] in {"PASS", "REVIEW"}
+    assert summary["gnss_loss_detected"] is True
+    assert summary["terrain_nav_entered"] is True
+
+
+def test_export_operator_outputs_writes_companion_files(tmp_path: Path) -> None:
+    output_paths = export_operator_outputs(
+        [
+            {
+                "timestamp": 1.0,
+                "estimated_lat": 60.5,
+                "estimated_lon": 90.3,
+                "truth_lat": 60.5,
+                "truth_lon": 90.3,
+                "estimated_speed_mps": 50.0,
+                "estimated_heading_deg": 45.0,
+                "gnss_available": False,
+                "mode": "TERRAIN_NAV",
+                "terrain_active": True,
+                "truth_error_m": 15.0,
+                "best_azimuth_deg": 45.0,
+                "best_offset_m": 100.0,
+                "correlation_peak": 0.92,
+            }
+        ],
+        tmp_path / "run_report.html",
+    )
+
+    assert output_paths["summary_txt"].exists()
+    assert output_paths["summary_json"].exists()
+    assert output_paths["records_csv"].exists()

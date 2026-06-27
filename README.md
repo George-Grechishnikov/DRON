@@ -55,6 +55,37 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
+## Быстрый показ результата
+
+Если нужен сценарий для обычного пользователя, запускай конвейер с флагом `--open-report`.
+Тогда после завершения прогона HTML-отчет откроется в браузере автоматически.
+
+Для кейсового набора из `config.yaml` достаточно одной команды:
+
+```bash
+.venv/bin/python main.py --config input/incoming/config.yaml --open-report
+```
+
+Или через готовый пользовательский launcher:
+
+```bash
+.venv/bin/python case_runner.py --config input/incoming/config.yaml
+```
+
+Пример:
+
+```bash
+.venv/bin/python main.py \
+  --replay \
+  --dem input/incoming/dem/terrain.tif \
+  --nmea input/incoming/radar_data.nmea \
+  --lat 60.56274504 \
+  --lon 90.37800000 \
+  --no-visualizer \
+  --report-path output/full_50k_report.html \
+  --open-report
+```
+
 ## Структура проекта
 
 ```text
@@ -79,6 +110,30 @@ DRON/
   integration_test.py
   test_main.py
 ```
+
+## Куда класть входные данные
+
+Для внешних тестовых или реальных данных используй готовую структуру:
+
+```text
+input/
+  incoming/
+    config.yaml
+    radar_data.nmea
+    truth.csv
+    barometer.csv
+    dem/
+      README.txt
+      terrain.tif
+```
+
+- `input/incoming/radar_data.nmea` — входной поток `GPGGA`
+- `input/incoming/truth.csv` — truth-траектория для сравнения
+- `input/incoming/barometer.csv` — барометрическая высота
+- `input/incoming/dem/` — DEM-файл
+- `input/incoming/config.yaml` — все пути и параметры
+
+Готовый шаблон уже добавлен в репозиторий.
 
 ## Что уже умеет проект
 
@@ -407,6 +462,30 @@ Preflight делает:
 
 ```powershell
 .\.venv\Scripts\python .\scripts\clean_cache.py --dry-run
+```
+
+### Валидация unified stream
+
+Проверка incoming JSONL перед запуском pipeline:
+
+```powershell
+.\.venv\Scripts\python .\sample_validator.py .\output\samples.jsonl
+```
+
+### Нормализация случайных входных данных
+
+Если дадут `.csv`, `.json` или `.jsonl` с другими именами полей, их можно привести
+к нашему unified sample формату так:
+
+```powershell
+.\.venv\Scripts\python .\sample_ingest.py .\input\random_samples.csv .\output\samples.jsonl
+```
+
+После этого уже можно:
+
+```powershell
+.\.venv\Scripts\python .\sample_validator.py .\output\samples.jsonl
+.\.venv\Scripts\python .\main.py --samples-jsonl .\output\samples.jsonl --dem .\data\dem.tif
 ```
 
 ### Проверка модулей тестами

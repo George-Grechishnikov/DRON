@@ -13,6 +13,7 @@ from main import (
     coerce_unified_sample,
     compute_replay_metrics,
     load_unified_samples_jsonl,
+    open_report_in_browser,
     parse_args,
     unified_sample_producer,
 )
@@ -90,6 +91,57 @@ def test_parse_args_accepts_report_path() -> None:
     )
 
     assert config.report_path == Path("reports/demo.html")
+
+
+def test_parse_args_accepts_open_report() -> None:
+    config = parse_args(
+        [
+            "--sim",
+            "--dem",
+            "data/dem.tif",
+            "--open-report",
+        ]
+    )
+
+    assert config.auto_open_report is True
+
+
+def test_open_report_in_browser_returns_false_for_missing_file(tmp_path: Path) -> None:
+    assert open_report_in_browser(tmp_path / "missing.html") is False
+
+
+def test_parse_args_config_case_mode(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    dem_dir = tmp_path / "dem"
+    dem_dir.mkdir()
+    (dem_dir / "terrain.tif").write_text("stub", encoding="utf-8")
+    (tmp_path / "radar_data.nmea").write_text("", encoding="utf-8")
+    (tmp_path / "truth.csv").write_text("timestamp,lat,lon,alt_msl,heading_deg,speed_mps\n", encoding="utf-8")
+    (tmp_path / "barometer.csv").write_text("timestamp,baro_alt_m\n", encoding="utf-8")
+    config_path.write_text(
+        "\n".join(
+            [
+                f"dem_path: {dem_dir}",
+                "radar_data_path: radar_data.nmea",
+                "truth_path: truth.csv",
+                "barometer_path: barometer.csv",
+                "sample_rate_hz: 4.0",
+                "gnss_drop_after_s: 12.0",
+                "visualization:",
+                "  enabled: true",
+                "  export_report_path: output/from_config.html",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = parse_args(["--config", str(config_path)])
+
+    assert config.mode == "case"
+    assert config.freq_hz == 4.0
+    assert config.gt_path == tmp_path / "truth.csv"
+    assert config.barometer_path == tmp_path / "barometer.csv"
+    assert config.report_path == Path("output/from_config.html")
 
 
 def test_coerce_unified_sample_from_bridge_dict() -> None:

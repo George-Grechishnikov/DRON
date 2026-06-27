@@ -69,3 +69,14 @@ def test_get_patch_returns_array_and_transform() -> None:
     assert patch.ndim == 2
     assert patch.size > 0
     assert hasattr(transform, "a")
+
+
+def test_get_elevation_tolerates_boundary_rounding() -> None:
+    memfile = _build_memory_dem()
+    try:
+        with DEMLoader(memfile.name) as dem:
+            value = dem.get_elevation(49.500001, 11.000001)
+    finally:
+        memfile.close()
+
+    assert np.isfinite(value)

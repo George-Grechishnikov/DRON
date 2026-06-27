@@ -22,6 +22,7 @@ from scipy.ndimage import map_coordinates
 
 LOGGER = logging.getLogger(__name__)
 WGS84_GEOD = Geod(ellps="WGS84")
+BOUNDARY_EPSILON_DEG = 1e-5
 
 
 @dataclass(frozen=True)
@@ -103,9 +104,11 @@ class DEMLoader:
     def get_elevation(self, lat: float, lon: float) -> float:
         """Return bilinearly interpolated elevation at lat/lon."""
 
-        self._validate_bounds(lat, lon)
+        lat, lon = self._coerce_to_bounds(lat, lon)
         row, col = self._fractional_index(lat, lon)
         data = self._read_window_array(row, col)
+        row = min(max(row, 0.0), float(data.shape[0] - 1))
+        col = min(max(col, 0.0), float(data.shape[1] - 1))
         sampled = map_coordinates(data, [[row], [col]], order=1, mode="nearest")[0]
         if np.isnan(sampled):
             return float("nan")
@@ -120,7 +123,7 @@ class DEMLoader:
             self._patch_cache.move_to_end(key)
             return cached[0].copy(), cached[1]
 
-        self._validate_bounds(lat, lon)
+        lat, lon = self._coerce_to_bounds(lat, lon)
         north_lon, north_lat, _ = WGS84_GEOD.fwd(lon, lat, 0.0, radius_m)
         east_lon, east_lat, _ = WGS84_GEOD.fwd(lon, lat, 90.0, radius_m)
         south_lon, south_lat, _ = WGS84_GEOD.fwd(lon, lat, 180.0, radius_m)
@@ -213,6 +216,19 @@ class DEMLoader:
                 f"Coordinate ({lat:.6f}, {lon:.6f}) is outside DEM bounds "
                 f"({bottom:.6f}, {left:.6f}) - ({top:.6f}, {right:.6f})"
             )
+
+    def _coerce_to_bounds(self, lat: float, lon: float) -> tuple[float, float]:
+        left, bottom, right, top = self.metadata.bounds
+        if (
+            left - BOUNDARY_EPSILON_DEG <= lon <= right + BOUNDARY_EPSILON_DEG
+            and bottom - BOUNDARY_EPSILON_DEG <= lat <= top + BOUNDARY_EPSILON_DEG
+        ):
+            return (
+                min(max(float(lat), bottom), top),
+                min(max(float(lon), left), right),
+            )
+        self._validate_bounds(lat, lon)
+        return float(lat), float(lon)
 
     @staticmethod
     def _patch_key(lat: float, lon: float, radius_m: float) -> tuple[float, float, float]:

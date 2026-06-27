@@ -1,9 +1,11 @@
-"""Plotly Dash dashboard for TERRAIN NAVIGATOR."""
+"""Plotly Dash dashboard and report exports for TERRAIN NAVIGATOR."""
 
 from __future__ import annotations
 
 import math
+import json
 import queue
+import csv
 from pathlib import Path
 from typing import Any, List
 
@@ -16,6 +18,149 @@ from plotly.subplots import make_subplots
 
 from correlator import CorrelationResult, build_heatmap
 from imm_filter import IMMResult
+
+
+def _finite_float(value: Any) -> float | None:
+    """Return a finite float or None."""
+
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _derive_output_paths(report_path: str | Path) -> dict[str, Path]:
+    """Build companion output paths next to the HTML report."""
+
+    base = Path(report_path)
+    suffix = base.suffix or ".html"
+    stem = base.name[: -len(suffix)] if base.name.endswith(suffix) else base.stem
+    return {
+        "html": base,
+        "summary_txt": base.with_name(f"{stem}.summary.txt"),
+        "summary_json": base.with_name(f"{stem}.summary.json"),
+        "records_csv": base.with_name(f"{stem}.records.csv"),
+    }
+
+
+def build_operator_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build a non-technical run summary for operators and reviewers."""
+
+    if not records:
+        return {
+            "status": "NO_DATA",
+            "status_label": "No data",
+            "headline": "No processed navigation windows were produced.",
+            "operator_message": "Run finished without usable output windows.",
+            "windows_processed": 0,
+            "gnss_loss_detected": False,
+            "terrain_nav_entered": False,
+        }
+
+    timestamps = [_finite_float(record.get("timestamp")) for record in records]
+    valid_timestamps = [value for value in timestamps if value is not None]
+    errors = [_finite_float(record.get("truth_error_m")) for record in records]
+    finite_errors = [value for value in errors if value is not None]
+    correlations = [_finite_float(record.get("correlation_peak")) for record in records]
+    finite_correlations = [value for value in correlations if value is not None]
+    gnss_flags = [bool(record.get("gnss_available", True)) for record in records]
+    modes = [str(record.get("mode", "INIT")).upper() for record in records]
+    gnss_loss_detected = any(not flag for flag in gnss_flags)
+    terrain_nav_entered = any(mode == "TERRAIN_NAV" for mode in modes)
+    final = records[-1]
+
+    avg_error_m = sum(finite_errors) / len(finite_errors) if finite_errors else None
+    max_error_m = max(finite_errors) if finite_errors else None
+    final_error_m = _finite_float(final.get("truth_error_m"))
+    avg_correlation = sum(finite_correlations) / len(finite_correlations) if finite_correlations else None
+    best_correlation = max(finite_correlations) if finite_correlations else None
+    duration_s = (
+        valid_timestamps[-1] - valid_timestamps[0]
+        if len(valid_timestamps) >= 2
+        else 0.0
+    )
+
+    if terrain_nav_entered and avg_correlation is not None and avg_correlation >= 0.85 and (
+        avg_error_m is None or avg_error_m <= 250.0
+    ):
+        status = "PASS"
+        status_label = "Pass"
+        headline = "Terrain navigation stayed usable after GNSS loss."
+    elif terrain_nav_entered and avg_correlation is not None and avg_correlation >= 0.65:
+        status = "REVIEW"
+        status_label = "Needs review"
+        headline = "Terrain navigation engaged, but quality should be reviewed."
+    else:
+        status = "FAIL"
+        status_label = "Fail"
+        headline = "The run did not show a stable terrain-navigation result."
+
+    operator_bits = [
+        f"Processed {len(records)} navigation windows over {duration_s:.1f} s.",
+        f"GNSS loss detected: {'yes' if gnss_loss_detected else 'no'}.",
+        f"Terrain navigation entered: {'yes' if terrain_nav_entered else 'no'}.",
+    ]
+    if avg_error_m is not None:
+        operator_bits.append(f"Average trajectory error: {avg_error_m:.1f} m.")
+    if max_error_m is not None:
+        operator_bits.append(f"Maximum trajectory error: {max_error_m:.1f} m.")
+    if avg_correlation is not None:
+        operator_bits.append(f"Average correlation peak: {avg_correlation:.3f}.")
+
+    return {
+        "status": status,
+        "status_label": status_label,
+        "headline": headline,
+        "operator_message": " ".join(operator_bits),
+        "windows_processed": len(records),
+        "start_timestamp_s": valid_timestamps[0] if valid_timestamps else None,
+        "end_timestamp_s": valid_timestamps[-1] if valid_timestamps else None,
+        "duration_s": duration_s,
+        "gnss_loss_detected": gnss_loss_detected,
+        "terrain_nav_entered": terrain_nav_entered,
+        "final_mode": str(final.get("mode", "INIT")),
+        "final_gnss_available": bool(final.get("gnss_available", True)),
+        "average_truth_error_m": avg_error_m,
+        "max_truth_error_m": max_error_m,
+        "final_truth_error_m": final_error_m,
+        "average_correlation_peak": avg_correlation,
+        "best_correlation_peak": best_correlation,
+    }
+
+
+def export_operator_outputs(records: list[dict[str, Any]], report_path: str | Path) -> dict[str, Path]:
+    """Export operator-facing summary files next to the HTML report."""
+
+    output_paths = _derive_output_paths(report_path)
+    for path in output_paths.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    summary = build_operator_summary(records)
+    summary_text = "\n".join(
+        [
+            "TERRAIN NAVIGATOR Run Summary",
+            f"Status: {summary['status_label']}",
+            f"Headline: {summary['headline']}",
+            f"Message: {summary['operator_message']}",
+            f"Final mode: {summary.get('final_mode', 'INIT')}",
+            f"Final GNSS: {'ON' if summary.get('final_gnss_available', True) else 'OFF'}",
+        ]
+    )
+    output_paths["summary_txt"].write_text(summary_text + "\n", encoding="utf-8")
+    output_paths["summary_json"].write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    if records:
+        fieldnames = list(records[0].keys())
+        with output_paths["records_csv"].open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(records)
+
+    return output_paths
 
 
 def create_arrow_shape(lat: float, lon: float, azimuth: float, length_deg: float = 0.002) -> list[dict[str, Any]]:
@@ -85,12 +230,13 @@ def export_flight_report(history: List[IMMResult], path: str) -> None:
     offline_plot(figure, filename=str(output_path), auto_open=False, include_plotlyjs="cdn")
 
 
-def export_demo_report(records: list[dict[str, Any]], path: str) -> None:
+def export_demo_report(records: list[dict[str, Any]], path: str, context: dict[str, Any] | None = None) -> None:
     """Export a jury-facing HTML report with truth, estimate, GNSS, and correlation."""
 
     if not records:
         return
 
+    context = context or {}
     timestamps = [float(record["timestamp"]) for record in records]
     estimated_lons = [float(record["estimated_lon"]) for record in records]
     estimated_lats = [float(record["estimated_lat"]) for record in records]
@@ -99,21 +245,43 @@ def export_demo_report(records: list[dict[str, Any]], path: str) -> None:
     correlation_peaks = [float(record["correlation_peak"]) for record in records]
     truth_errors = [float(record["truth_error_m"]) for record in records]
     gnss_available = [bool(record["gnss_available"]) for record in records]
+    final_heatmap = context.get("correlation_heatmap")
+    final_dem_patch = context.get("dem_patch")
+    final_dem_extent = context.get("dem_extent")
 
     gnss_loss_index = next((idx for idx, available in enumerate(gnss_available) if not available), None)
     gnss_loss_time = timestamps[gnss_loss_index] if gnss_loss_index is not None else None
 
     figure = make_subplots(
-        rows=3,
+        rows=4,
         cols=1,
         shared_xaxes=False,
-        vertical_spacing=0.12,
+        vertical_spacing=0.08,
         subplot_titles=(
-            "Truth vs Estimated Trajectory",
+            "Trajectory on DEM Patch",
+            "Correlation Heatmap",
             "Correlation Peak",
             "Truth Error and GNSS Status",
         ),
     )
+    if final_dem_patch is not None and final_dem_extent is not None:
+        dem_patch = np.asarray(final_dem_patch, dtype=float)
+        extent = final_dem_extent
+        x_axis = np.linspace(float(extent["left"]), float(extent["right"]), dem_patch.shape[1])
+        y_axis = np.linspace(float(extent["top"]), float(extent["bottom"]), dem_patch.shape[0])
+        figure.add_trace(
+            go.Heatmap(
+                z=dem_patch,
+                x=x_axis,
+                y=y_axis,
+                colorscale="Earth",
+                opacity=0.85,
+                showscale=False,
+                name="DEM patch",
+            ),
+            row=1,
+            col=1,
+        )
     if any(value is not None for value in truth_lons) and any(value is not None for value in truth_lats):
         figure.add_trace(
             go.Scatter(
@@ -135,9 +303,9 @@ def export_demo_report(records: list[dict[str, Any]], path: str) -> None:
             line={"color": "#2d9cdb", "width": 3},
             marker={"size": 5},
         ),
-        row=1,
-        col=1,
-    )
+            row=1,
+            col=1,
+        )
     if gnss_loss_index is not None:
         figure.add_trace(
             go.Scatter(
@@ -153,6 +321,31 @@ def export_demo_report(records: list[dict[str, Any]], path: str) -> None:
             col=1,
         )
 
+    if final_heatmap is not None:
+        heatmap = np.asarray(final_heatmap, dtype=float)
+        figure.add_trace(
+            go.Heatmap(
+                z=heatmap,
+                colorscale="Viridis",
+                colorbar={"title": "r norm"},
+                name="Correlation heatmap",
+            ),
+            row=2,
+            col=1,
+        )
+        final_record = records[-1]
+        figure.add_trace(
+            go.Scatter(
+                x=[float(final_record["best_offset_m"])],
+                y=[float(final_record["best_azimuth_deg"])],
+                mode="markers",
+                marker={"color": "#ff5a5f", "symbol": "star", "size": 14},
+                name="Final peak",
+            ),
+            row=2,
+            col=1,
+        )
+
     figure.add_trace(
         go.Scatter(
             x=timestamps,
@@ -162,7 +355,7 @@ def export_demo_report(records: list[dict[str, Any]], path: str) -> None:
             line={"color": "#27ae60", "width": 3},
             marker={"size": 5},
         ),
-        row=2,
+        row=3,
         col=1,
     )
     figure.add_trace(
@@ -173,7 +366,7 @@ def export_demo_report(records: list[dict[str, Any]], path: str) -> None:
             name="Truth error, m",
             line={"color": "#ff6b6b", "width": 3},
         ),
-        row=3,
+        row=4,
         col=1,
     )
     figure.add_trace(
@@ -185,12 +378,12 @@ def export_demo_report(records: list[dict[str, Any]], path: str) -> None:
             line={"color": "#ffd166", "width": 2, "shape": "hv"},
             yaxis="y4",
         ),
-        row=3,
+        row=4,
         col=1,
     )
 
     if gnss_loss_time is not None:
-        for row in (2, 3):
+        for row in (3, 4):
             figure.add_vline(
                 x=gnss_loss_time,
                 line={"color": "#ffd166", "dash": "dash", "width": 2},
@@ -199,7 +392,9 @@ def export_demo_report(records: list[dict[str, Any]], path: str) -> None:
             )
 
     final = records[-1]
+    operator_summary = build_operator_summary(records)
     summary = (
+        f"Status: {operator_summary['status_label']}<br>"
         f"Final mode: {final['mode']}<br>"
         f"GNSS: {'ON' if final['gnss_available'] else 'OFF'}<br>"
         f"Final error: {float(final['truth_error_m']):.1f} m<br>"
@@ -210,7 +405,7 @@ def export_demo_report(records: list[dict[str, Any]], path: str) -> None:
     figure.update_layout(
         template="plotly_dark",
         title="TERRAIN NAVIGATOR Demo Report",
-        height=1000,
+        height=1320,
         annotations=[
             *list(figure.layout.annotations),
             {
@@ -231,14 +426,17 @@ def export_demo_report(records: list[dict[str, Any]], path: str) -> None:
     )
     figure.update_xaxes(title_text="Longitude", row=1, col=1)
     figure.update_yaxes(title_text="Latitude", row=1, col=1)
-    figure.update_xaxes(title_text="Time, s", row=2, col=1)
-    figure.update_yaxes(title_text="Correlation", row=2, col=1)
+    figure.update_xaxes(title_text="Offset index", row=2, col=1)
+    figure.update_yaxes(title_text="Azimuth index", row=2, col=1)
     figure.update_xaxes(title_text="Time, s", row=3, col=1)
-    figure.update_yaxes(title_text="Error, m", row=3, col=1)
+    figure.update_yaxes(title_text="Correlation", row=3, col=1)
+    figure.update_xaxes(title_text="Time, s", row=4, col=1)
+    figure.update_yaxes(title_text="Error, m", row=4, col=1)
 
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     offline_plot(figure, filename=str(output_path), auto_open=False, include_plotlyjs="cdn")
+    export_operator_outputs(records, output_path)
 
 
 class TerrainNavigatorDash:

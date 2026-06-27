@@ -10,6 +10,7 @@ import queue
 import signal
 import threading
 import time
+import webbrowser
 from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -18,6 +19,7 @@ from typing import Any, Iterable, List
 import numpy as np
 import pyproj
 
+from case_reader import CaseInputConfig, iter_case_unified_samples
 from correlator import Correlator, CorrelationResult
 from dem_loader import DEMLoader
 from imm_filter import IMMFilter, IMMResult
@@ -25,7 +27,7 @@ from nmea_parser import NMEAFrame, NMEAReader
 from position_solver import PositionEstimate, PositionSolver
 from profile_extractor import ProfileExtractor, is_flat_terrain
 from sim_generator import SimulationConfig, TrajectoryPoint, generate_points
-from visualizer import TerrainNavigatorDash, export_demo_report, export_flight_report
+from visualizer import TerrainNavigatorDash, export_demo_report, export_flight_report, export_operator_outputs
 
 
 LOGGER = logging.getLogger(__name__)
@@ -40,9 +42,11 @@ class Config:
     start_lat: float
     start_lon: float
     trajectory: int
+    config_path: Path | None
     nmea_path: Path | None
     samples_path: Path | None
     gt_path: Path | None
+    barometer_path: Path | None
     udp_host: str
     udp_port: int
     dashboard_host: str
@@ -61,6 +65,7 @@ class Config:
     cold_start_windows: int = 3
     gnss_drop_after_s: float | None = None
     report_path: Path = Path("output") / "terrain_navigator_report.html"
+    auto_open_report: bool = False
     log_level: str = "INFO"
 
 
@@ -158,13 +163,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
     """Create the CLI parser for the main orchestrator."""
 
     parser = argparse.ArgumentParser(description="Run the TERRAIN NAVIGATOR pipeline")
-    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group = parser.add_mutually_exclusive_group(required=False)
     mode_group.add_argument("--sim", action="store_true", help="Simulation mode")
     mode_group.add_argument("--live", action="store_true", help="Live UDP mode")
     mode_group.add_argument("--replay", action="store_true", help="Replay NMEA log mode")
     mode_group.add_argument("--samples-jsonl", "--unified-stream", type=Path, help="Replay unified sample JSONL stream")
-
-    parser.add_argument("--dem", required=True, type=Path, help="Path to DEM GeoTIFF")
+    parser.add_argument("--config", type=Path, help="Path to case config.yaml")
+    parser.add_argument("--dem", type=Path, help="Path to DEM GeoTIFF")
     parser.add_argument("--lat", type=float, default=60.5, help="Initial latitude")
     parser.add_argument("--lon", type=float, default=90.3, help="Initial longitude")
     parser.add_argument("--trajectory", type=int, default=1, choices=(1, 2, 3), help="Simulation trajectory id")
@@ -197,6 +202,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=Path("output") / "terrain_navigator_report.html",
         help="HTML report output path",
     )
+    parser.add_argument("--open-report", action="store_true", help="Open the HTML report in a browser after the run")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     return parser
 
@@ -205,40 +211,114 @@ def parse_args(argv: list[str] | None = None) -> Config:
     """Parse CLI arguments into a Config object."""
 
     parser = build_argument_parser()
+    raw_argv = list(argv) if argv is not None else []
     args = parser.parse_args(argv)
-    if args.replay and args.nmea is None:
+    if args.config is None and not any((args.sim, args.live, args.replay, args.samples_jsonl)):
+        parser.error("choose a mode flag or pass --config")
+    if args.replay and args.nmea is None and args.config is None:
         parser.error("--nmea is required in replay mode")
+    config_payload = load_yaml_config(args.config) if args.config is not None else {}
+    visualization_cfg = config_payload.get("visualization", {}) if isinstance(config_payload.get("visualization"), dict) else {}
+    correlation_cfg = config_payload.get("correlation", {}) if isinstance(config_payload.get("correlation"), dict) else {}
 
-    mode = "sim" if args.sim else "live" if args.live else "samples" if args.samples_jsonl else "replay"
+    def explicit(option: str) -> bool:
+        return option in raw_argv
+
+    mode = "sim" if args.sim else "live" if args.live else "samples" if args.samples_jsonl else "replay" if args.replay else "case"
+    dem_path = args.dem if explicit("--dem") else _resolve_dem_path(_path_from_config(config_payload, "dem_path", args.config) or args.dem)
+    if dem_path is None:
+        parser.error("DEM path is required via --dem or config.yaml")
+    nmea_path = args.nmea if explicit("--nmea") else _path_from_config(config_payload, "radar_data_path", args.config) or args.nmea
+    gt_path = args.gt if explicit("--gt") else _path_from_config(config_payload, "truth_path", args.config) or args.gt
+    barometer_path = _path_from_config(config_payload, "barometer_path", args.config)
+    if mode == "case" and (nmea_path is None or gt_path is None or barometer_path is None):
+        parser.error("case mode requires radar_data_path, truth_path, and barometer_path in config.yaml")
+    if mode == "replay" and nmea_path is None:
+        parser.error("--nmea is required in replay mode")
     return Config(
         mode=mode,
-        dem_path=args.dem,
+        dem_path=dem_path,
         start_lat=args.lat,
         start_lon=args.lon,
         trajectory=args.trajectory,
-        nmea_path=args.nmea,
+        config_path=args.config,
+        nmea_path=nmea_path,
         samples_path=args.samples_jsonl,
-        gt_path=args.gt,
+        gt_path=gt_path,
+        barometer_path=barometer_path,
         udp_host=args.udp_host,
         udp_port=args.udp_port,
-        dashboard_host=args.dashboard_host,
-        dashboard_port=args.dashboard_port,
-        enable_visualizer=not args.no_visualizer,
+        dashboard_host=args.dashboard_host if explicit("--dashboard-host") else str(visualization_cfg.get("dashboard_host", args.dashboard_host)),
+        dashboard_port=args.dashboard_port if explicit("--dashboard-port") else int(visualization_cfg.get("dashboard_port", args.dashboard_port)),
+        enable_visualizer=not args.no_visualizer if explicit("--no-visualizer") else bool(visualization_cfg.get("enabled", True)),
         seed=args.seed,
         speed_mps=args.speed,
         altitude_msl_m=args.altitude_msl,
         noise_sigma=args.noise,
         window_size=args.window_size,
         step_size=args.step_size,
-        freq_hz=args.freq,
+        freq_hz=args.freq if explicit("--freq") else float(config_payload.get("sample_rate_hz", args.freq)),
         dem_patch_radius_m=args.dem_patch_radius,
-        max_offset_m=args.max_offset,
-        flat_terrain_threshold_m=args.flat_threshold,
-        cold_start_windows=args.cold_start_windows,
-        gnss_drop_after_s=args.gnss_drop_after,
-        report_path=args.report_path,
+        max_offset_m=args.max_offset if explicit("--max-offset") else float(correlation_cfg.get("max_offset_m", args.max_offset)),
+        flat_terrain_threshold_m=args.flat_threshold if explicit("--flat-threshold") else float(correlation_cfg.get("flat_terrain_threshold_m", args.flat_threshold)),
+        cold_start_windows=args.cold_start_windows if explicit("--cold-start-windows") else int(correlation_cfg.get("cold_start_windows", args.cold_start_windows)),
+        gnss_drop_after_s=args.gnss_drop_after if explicit("--gnss-drop-after") else _optional_float(config_payload.get("gnss_drop_after_s")),
+        report_path=args.report_path if explicit("--report-path") else Path(str(visualization_cfg.get("export_report_path", args.report_path))),
+        auto_open_report=args.open_report,
         log_level=args.log_level,
     )
+
+
+def _optional_float(value: Any) -> float | None:
+    return None if value is None else float(value)
+
+
+def load_yaml_config(path: Path) -> dict[str, Any]:
+    """Load config.yaml for case-driven runs."""
+
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError("PyYAML is required for --config support") from exc
+    payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(payload, dict):
+        raise ValueError(f"Config root must be a mapping: {path}")
+    return payload
+
+
+def _path_from_config(payload: dict[str, Any], key: str, config_path: Path | None) -> Path | None:
+    value = payload.get(key)
+    if value in (None, ""):
+        return None
+    path = Path(str(value))
+    if path.is_absolute() or config_path is None:
+        return path
+    if path.exists():
+        return path
+    return (config_path.parent / path).resolve()
+
+
+def _resolve_dem_path(path: Path | None) -> Path | None:
+    if path is None:
+        return None
+    if path.is_dir():
+        for pattern in ("*.tif", "*.tiff", "*.hgt"):
+            matches = sorted(path.glob(pattern))
+            if matches:
+                return matches[0]
+    return path
+
+
+def open_report_in_browser(report_path: Path) -> bool:
+    """Open the generated HTML report in the default browser."""
+
+    if not report_path.exists():
+        return False
+    try:
+        return bool(webbrowser.open(report_path.resolve().as_uri()))
+    except Exception:
+        LOGGER.warning("Failed to open report in browser: %s", report_path)
+        return False
 
 
 def configure_logging(level: str, log_path: Path) -> None:
@@ -263,27 +343,45 @@ def load_ground_truth_csv(path: Path, geod: pyproj.Geod | None = None) -> list[G
     rows: list[dict[str, float]] = []
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
+        header = set(reader.fieldnames or [])
+        use_case_header = {"timestamp", "lat", "lon"}.issubset(header) and "timestamp_s" not in header
         for row in reader:
-            rows.append(
-                {
-                    "index": float(row["index"]),
-                    "timestamp_s": float(row["timestamp_s"]),
-                    "lat": float(row["lat"]),
-                    "lon": float(row["lon"]),
-                }
-            )
+            if use_case_header:
+                rows.append(
+                    {
+                        "index": float(len(rows)),
+                        "timestamp_s": float(row["timestamp"]),
+                        "lat": float(row["lat"]),
+                        "lon": float(row["lon"]),
+                        "speed_mps": float(row["speed_mps"]) if row.get("speed_mps") else float("nan"),
+                        "azimuth_deg": float(row["heading_deg"]) if row.get("heading_deg") else float("nan"),
+                    }
+                )
+            else:
+                rows.append(
+                    {
+                        "index": float(row["index"]),
+                        "timestamp_s": float(row["timestamp_s"]),
+                        "lat": float(row["lat"]),
+                        "lon": float(row["lon"]),
+                    }
+                )
 
     gt_points: list[GroundTruthPoint] = []
     for idx, row in enumerate(rows):
         if idx == 0:
-            speed_mps = 0.0
-            azimuth_deg = 0.0
+            speed_mps = float(row.get("speed_mps", 0.0))
+            azimuth_deg = float(row.get("azimuth_deg", 0.0))
         else:
             prev = rows[idx - 1]
-            azimuth_deg, _, distance_m = geod.inv(prev["lon"], prev["lat"], row["lon"], row["lat"])
-            dt = max(row["timestamp_s"] - prev["timestamp_s"], 1e-6)
-            speed_mps = distance_m / dt
-            azimuth_deg = float(azimuth_deg % 360.0)
+            if np.isfinite(row.get("speed_mps", float("nan"))) and np.isfinite(row.get("azimuth_deg", float("nan"))):
+                speed_mps = float(row["speed_mps"])
+                azimuth_deg = float(row["azimuth_deg"] % 360.0)
+            else:
+                azimuth_deg, _, distance_m = geod.inv(prev["lon"], prev["lat"], row["lon"], row["lat"])
+                dt = max(row["timestamp_s"] - prev["timestamp_s"], 1e-6)
+                speed_mps = distance_m / dt
+                azimuth_deg = float(azimuth_deg % 360.0)
         gt_points.append(
             GroundTruthPoint(
                 index=int(row["index"]),
@@ -538,6 +636,27 @@ def samples_jsonl_producer(
     unified_sample_producer(load_unified_samples_jsonl(config.samples_path), frame_queue, stop_event)
 
 
+def case_config_producer(
+    config: Config,
+    frame_queue: queue.Queue,
+    stop_event: threading.Event,
+) -> None:
+    """Produce unified samples from case-style config inputs."""
+
+    assert config.nmea_path is not None
+    assert config.gt_path is not None
+    assert config.barometer_path is not None
+    case_config = CaseInputConfig(
+        dem_path=config.dem_path,
+        radar_data_path=config.nmea_path,
+        truth_path=config.gt_path,
+        barometer_path=config.barometer_path,
+        sample_rate_hz=config.freq_hz,
+        gnss_drop_after_s=config.gnss_drop_after_s,
+    )
+    unified_sample_producer(iter_case_unified_samples(case_config), frame_queue, stop_event)
+
+
 def simulation_producer(
     config: Config,
     frame_queue: queue.Queue,
@@ -664,6 +783,7 @@ def pipeline_worker(
     pipeline_done_event: threading.Event,
     ground_truth: list[GroundTruthPoint] | None = None,
     report_records: list[dict[str, Any]] | None = None,
+    report_context: dict[str, Any] | None = None,
 ) -> list[tuple[int, IMMResult]]:
     """Run the main sliding-window pipeline."""
 
@@ -800,6 +920,18 @@ def pipeline_worker(
                         "correlation_peak": float(latest_sample.correlation_score or corr_result.peak_correlation),
                     }
                 )
+            if report_context is not None:
+                report_context["correlation_heatmap"] = np.asarray(
+                    latest_sample.correlation_heatmap if latest_sample.correlation_heatmap is not None else corr_result.heatmap,
+                    dtype=float,
+                ).tolist()
+                report_context["dem_patch"] = np.asarray(dem_patch, dtype=float).tolist()
+                report_context["dem_extent"] = {
+                    "left": float(min(left, right)),
+                    "right": float(max(left, right)),
+                    "bottom": float(min(bottom, top)),
+                    "top": float(max(bottom, top)),
+                }
             _enqueue_state(
                 state_queue,
                 {
@@ -878,11 +1010,12 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
     ground_truth: list[GroundTruthPoint] | None = None
     if config.mode == "sim":
         ground_truth = build_sim_ground_truth(make_simulation_points(config))
-    elif config.mode == "replay" and config.gt_path is not None:
+    elif config.mode in {"replay", "case"} and config.gt_path is not None:
         ground_truth = load_ground_truth_csv(config.gt_path)
 
     pipeline_history: list[tuple[int, IMMResult]] = []
     report_records: list[dict[str, Any]] = []
+    report_context: dict[str, Any] = {}
     pipeline_metrics: ReplayMetrics | None = None
 
     def producer_target() -> None:
@@ -891,6 +1024,8 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
                 simulation_producer(config, frame_queue, stop_event)
             elif config.mode == "replay":
                 replay_producer(config, frame_queue, stop_event)
+            elif config.mode == "case":
+                case_config_producer(config, frame_queue, stop_event)
             elif config.mode == "samples":
                 samples_jsonl_producer(config, frame_queue, stop_event)
             else:
@@ -908,6 +1043,7 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
             pipeline_done_event=producer_done_event,
             ground_truth=ground_truth,
             report_records=report_records,
+            report_context=report_context,
         )
         pipeline_done_event.set()
 
@@ -944,7 +1080,7 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
         stop_event.set()
         signal.signal(signal.SIGINT, previous_handler)
 
-    if config.mode in {"sim", "replay", "samples"} and ground_truth is not None:
+    if config.mode in {"sim", "replay", "samples", "case"} and ground_truth is not None:
         pipeline_metrics = compute_replay_metrics(pipeline_history, ground_truth)
         LOGGER.info(
             "Replay metrics | mean=%.2f m | max=%.2f m | rmse=%.2f m | speed=%.2f m/s | azimuth=%.2f deg",
@@ -957,9 +1093,33 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
 
     dashboard_history = [item for _, item in pipeline_history]
     if report_records:
-        export_demo_report(report_records, str(config.report_path))
+        export_demo_report(report_records, str(config.report_path), context=report_context)
     elif dashboard_history:
         export_flight_report(dashboard_history, str(config.report_path))
+        export_operator_outputs(
+            [
+                {
+                    "timestamp": float(index),
+                    "estimated_lat": float(item.lat),
+                    "estimated_lon": float(item.lon),
+                    "truth_lat": None,
+                    "truth_lon": None,
+                    "estimated_speed_mps": float(item.speed_mps),
+                    "estimated_heading_deg": float(item.azimuth_deg),
+                    "gnss_available": False,
+                    "mode": str(item.dominant_mode).upper(),
+                    "terrain_active": False,
+                    "truth_error_m": float("nan"),
+                    "best_azimuth_deg": float(item.azimuth_deg),
+                    "best_offset_m": 0.0,
+                    "correlation_peak": float("nan"),
+                }
+                for index, item in enumerate(dashboard_history, start=1)
+            ],
+            str(config.report_path),
+        )
+    if config.auto_open_report:
+        open_report_in_browser(config.report_path)
     return pipeline_history, pipeline_metrics
 
 

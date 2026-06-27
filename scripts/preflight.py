@@ -21,7 +21,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 PYTHON_FILES = [
+    "case_runner.py",
+    "case_reader.py",
     "correlation_fallback.py",
+    "sample_ingest.py",
+    "sample_validator.py",
     "sim_generator.py",
     "nmea_parser.py",
     "dem_loader.py",
