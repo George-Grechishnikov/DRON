@@ -4,5 +4,7 @@ pyproj>=3.6
 scipy>=1.13
 dash>=3.0
 plotly>=5.20
+fastapi>=0.115
+uvicorn>=0.30
 pytest>=8.0
 PyYAML>=6.0

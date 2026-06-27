@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="dron-session-token" content="__DRON_SESSION_TOKEN__" />
+  <title>Terrain Navigation System</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f141a;
+      --panel: #161d24;
+      --panel-alt: #1b232c;
+      --border: #293542;
+      --text: #e7edf3;
+      --muted: #9bb0c4;
+      --accent: #2f81f7;
+      --good: #2ea043;
+      --warn: #d29922;
+      --bad: #f85149;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, Segoe UI, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    .shell {
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+      min-height: 100vh;
+    }
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+    }
+    .title {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .title h1 {
+      margin: 0;
+      font-size: 22px;
+      font-weight: 700;
+    }
+    .title p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .status-strip {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border: 1px solid var(--border);
+      background: var(--panel-alt);
+      min-height: 36px;
+      white-space: nowrap;
+    }
+    .controls-band,
+    .content-grid {
+      padding: 16px 20px;
+    }
+    .controls-band {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 16px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel-alt);
+    }
+    .panel {
+      border: 1px solid var(--border);
+      background: var(--panel);
+      padding: 14px;
+    }
+    .panel h2 {
+      margin: 0 0 12px;
+      font-size: 15px;
+      font-weight: 650;
+    }
+    .field-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px 12px;
+    }
+    .field {
+      display: grid;
+      gap: 6px;
+    }
+    .field label {
+      font-size: 12px;
+      color: var(--muted);
+    }
+    input, button, textarea {
+      font: inherit;
+    }
+    input {
+      width: 100%;
+      border: 1px solid var(--border);
+      background: #0f1720;
+      color: var(--text);
+      padding: 10px 12px;
+      min-height: 40px;
+    }
+    .button-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 12px;
+    }
+    button {
+      border: 1px solid var(--border);
+      background: #1a2330;
+      color: var(--text);
+      padding: 10px 12px;
+      min-height: 40px;
+      cursor: pointer;
+    }
+    button.primary { background: var(--accent); border-color: var(--accent); }
+    button.good { background: var(--good); border-color: var(--good); }
+    button.warn { background: var(--warn); border-color: var(--warn); color: #111; }
+    button.bad { background: var(--bad); border-color: var(--bad); }
+    .mini-stats {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .metric {
+      border: 1px solid var(--border);
+      background: #111821;
+      padding: 12px;
+      min-height: 84px;
+    }
+    .metric .label {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 8px;
+    }
+    .metric .value {
+      font-size: 22px;
+      font-weight: 700;
+    }
+    .metric .sub {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .content-grid {
+      display: grid;
+      grid-template-columns: 1.5fr 1.1fr;
+      gap: 16px;
+      align-items: start;
+    }
+    .stack {
+      display: grid;
+      gap: 16px;
+    }
+    .plot {
+      width: 100%;
+      min-height: 340px;
+    }
+    .plot.tall { min-height: 420px; }
+    .logbox, .jsonbox {
+      border: 1px solid var(--border);
+      background: #0f1720;
+      padding: 12px;
+      min-height: 180px;
+      max-height: 280px;
+      overflow: auto;
+      white-space: pre-wrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+    }
+    .status-line {
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 10px;
+      min-height: 20px;
+    }
+    @media (max-width: 1100px) {
+      .controls-band, .content-grid { grid-template-columns: 1fr; }
+      .field-grid, .mini-stats { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="topbar">
+      <div class="title">
+        <h1>DRON / Terrain Navigation System</h1>
+        <p>Local engineering replay UI for terrain navigation demo with protected local control session</p>
+      </div>
+      <div class="status-strip">
+        <div class="badge" id="healthBadge">Backend: checking</div>
+        <div class="badge" id="datasetBadge">Dataset: not loaded</div>
+        <div class="badge" id="navBadge">Mode: IDLE</div>
+        <div class="badge" id="gnssBadge">GNSS: --</div>
+      </div>
+    </div>
+
+    <div class="controls-band">
+      <section class="panel">
+        <h2>Dataset and Replay</h2>
+        <div class="field-grid">
+          <div class="field">
+            <label for="configPath">config.yaml</label>
+            <input id="configPath" value="input/incoming/config.yaml" />
+          </div>
+          <div class="field">
+            <label for="demPath">DEM path</label>
+            <input id="demPath" value="input/incoming/dem/terrain.tif" />
+          </div>
+          <div class="field">
+            <label for="radarPath">radar_data.nmea</label>
+            <input id="radarPath" value="input/incoming/radar_data.nmea" />
+          </div>
+          <div class="field">
+            <label for="truthPath">truth.csv</label>
+            <input id="truthPath" value="input/incoming/truth.csv" />
+          </div>
+          <div class="field">
+            <label for="baroPath">barometer.csv</label>
+            <input id="baroPath" value="input/incoming/barometer.csv" />
+          </div>
+          <div class="field">
+            <label for="replaySpeed">Replay speed</label>
+            <input id="replaySpeed" type="number" min="0.1" step="0.1" value="1.0" />
+          </div>
+        </div>
+        <div class="button-row">
+          <button class="primary" id="validateBtn">Validate</button>
+          <button class="good" id="loadBtn">Load dataset</button>
+          <button class="good" id="startBtn">Start replay</button>
+          <button id="pauseBtn">Pause</button>
+          <button class="warn" id="stopBtn">Stop</button>
+          <button id="backBtn">Step -</button>
+          <button id="forwardBtn">Step +</button>
+        </div>
+        <div class="status-line" id="actionStatus">Ready.</div>
+      </section>
+
+      <section class="panel">
+        <h2>Current State</h2>
+        <div class="mini-stats">
+          <div class="metric">
+            <div class="label">Timestamp</div>
+            <div class="value" id="timestampValue">0.0 s</div>
+            <div class="sub" id="sampleIndexValue">sample 0 / 0</div>
+          </div>
+          <div class="metric">
+            <div class="label">Correlation</div>
+            <div class="value" id="corrValue">--</div>
+            <div class="sub" id="errorValue">error --</div>
+          </div>
+          <div class="metric">
+            <div class="label">Radar / Baro</div>
+            <div class="value" id="altValue">--</div>
+            <div class="sub" id="terrainValue">terrain --</div>
+          </div>
+          <div class="metric">
+            <div class="label">Estimate</div>
+            <div class="value" id="estimateValue">--</div>
+            <div class="sub" id="truthValue">truth --</div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <main class="content-grid">
+      <div class="stack">
+        <section class="panel">
+          <h2>Trajectory and Events</h2>
+          <div id="trajectoryPlot" class="plot tall"></div>
+        </section>
+        <section class="panel">
+          <h2>Correlation Heatmap</h2>
+          <div id="heatmapPlot" class="plot"></div>
+        </section>
+        <section class="panel">
+          <h2>Altitude Profiles</h2>
+          <div id="profilesPlot" class="plot"></div>
+        </section>
+      </div>
+
+      <div class="stack">
+        <section class="panel">
+          <h2>Error and Correlation Timeline</h2>
+          <div id="timelinePlot" class="plot"></div>
+        </section>
+        <section class="panel">
+          <h2>Mission Metrics</h2>
+          <div id="metricsBox" class="jsonbox"></div>
+        </section>
+        <section class="panel">
+          <h2>System Logs</h2>
+          <div id="logsBox" class="logbox"></div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    const plotLayoutBase = {
+      paper_bgcolor: "#161d24",
+      plot_bgcolor: "#161d24",
+      font: { color: "#e7edf3" },
+      margin: { l: 50, r: 20, t: 40, b: 45 }
+    };
+    const sessionToken = document.querySelector('meta[name="dron-session-token"]')?.content || "";
+
+    async function api(path, options = {}) {
+      const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+      if ((options.method || "GET").toUpperCase() !== "GET" && sessionToken) {
+        headers["X-DRON-Session-Token"] = sessionToken;
+      }
+      const response = await fetch(path, {
+        headers,
+        ...options
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || JSON.stringify(data));
+      }
+      return data;
+    }
+
+    function setStatus(message, isError = false) {
+      const target = document.getElementById("actionStatus");
+      target.textContent = message;
+      target.style.color = isError ? "#f85149" : "#9bb0c4";
+    }
+
+    function requestPayload() {
+      return {
+        config_path: document.getElementById("configPath").value,
+        dem_path: document.getElementById("demPath").value,
+        radar_data_path: document.getElementById("radarPath").value,
+        truth_path: document.getElementById("truthPath").value,
+        barometer_path: document.getElementById("baroPath").value
+      };
+    }
+
+    async function loadHealth() {
+      try {
+        const health = await api("/api/health");
+        document.getElementById("healthBadge").textContent = `Backend: ${health.status}`;
+      } catch (error) {
+        document.getElementById("healthBadge").textContent = "Backend: error";
+      }
+    }
+
+    async function validateDataset() {
+      try {
+        const data = await api("/api/dataset/validate");
+        document.getElementById("datasetBadge").textContent = `Dataset: ${data.valid ? "valid" : "invalid"}`;
+        setStatus(data.valid ? "Dataset validation passed." : `Validation errors: ${data.errors.join("; ")}`, !data.valid);
+      } catch (error) {
+        setStatus(error.message, true);
+      }
+    }
+
+    async function loadDataset() {
+      try {
+        const data = await api("/api/dataset/load", {
+          method: "POST",
+          body: JSON.stringify(requestPayload())
+        });
+        document.getElementById("datasetBadge").textContent = `Dataset: ${data.radar_samples} radar`;
+        setStatus(`Loaded ${data.radar_samples} radar samples, ${data.truth_samples} truth samples, ${data.barometer_samples} barometer samples.`);
+        await refreshStaticPanels();
+      } catch (error) {
+        setStatus(error.message, true);
+      }
+    }
+
+    async function replayAction(path, body = null) {
+      try {
+        const data = await api(path, {
+          method: "POST",
+          body: body ? JSON.stringify(body) : "{}"
+        });
+        setStatus(`Action completed: ${path}`);
+        return data;
+      } catch (error) {
+        setStatus(error.message, true);
+        return null;
+      }
+    }
+
+    function renderMetrics(metrics) {
+      document.getElementById("metricsBox").textContent = JSON.stringify(metrics, null, 2);
+    }
+
+    function renderLogs(payload) {
+      const lines = (payload.logs || []).map(item => `[${item.time}] ${item.level} ${item.message}`);
+      document.getElementById("logsBox").textContent = lines.join("\n");
+    }
+
+    function updateStateCards(state) {
+      document.getElementById("timestampValue").textContent = `${(state.timestamp || 0).toFixed(1)} s`;
+      document.getElementById("sampleIndexValue").textContent = `sample ${state.sample_index || 0} / ${state.total_samples || 0}`;
+      document.getElementById("corrValue").textContent = state.correlation_score == null ? "--" : state.correlation_score.toFixed(3);
+      document.getElementById("errorValue").textContent = state.position_error_m == null ? "error --" : `error ${state.position_error_m.toFixed(1)} m`;
+      const radar = state.radar_alt_m == null ? "--" : state.radar_alt_m.toFixed(1);
+      const baro = state.baro_alt_m == null ? "--" : state.baro_alt_m.toFixed(1);
+      document.getElementById("altValue").textContent = `${radar} / ${baro} m`;
+      document.getElementById("terrainValue").textContent = state.terrain_h == null ? "terrain --" : `terrain ${state.terrain_h.toFixed(1)} m`;
+      const estimate = state.estimate || {};
+      const truth = state.truth || {};
+      document.getElementById("estimateValue").textContent =
+        estimate.lat == null ? "--" : `${estimate.lat.toFixed(5)}, ${estimate.lon.toFixed(5)}`;
+      document.getElementById("truthValue").textContent =
+        truth.lat == null ? "truth --" : `truth ${truth.lat.toFixed(5)}, ${truth.lon.toFixed(5)}`;
+      document.getElementById("navBadge").textContent = `Mode: ${state.nav_mode || "--"}`;
+      document.getElementById("gnssBadge").textContent = `GNSS: ${state.gnss_available ? "ON" : "OFF"}`;
+    }
+
+    async function refreshState() {
+      try {
+        const state = await api("/api/state");
+        updateStateCards(state);
+      } catch (error) {
+        setStatus(error.message, true);
+      }
+    }
+
+    async function refreshStaticPanels() {
+      try {
+        const [trajectory, heatmap, profiles, metrics, logs] = await Promise.all([
+          api("/api/trajectory").catch(() => ({ truth: [], estimated: [], events: [] })),
+          api("/api/correlation/heatmap").catch(() => null),
+          api("/api/profiles").catch(() => null),
+          api("/api/metrics").catch(() => ({})),
+          api("/api/logs").catch(() => ({ logs: [] }))
+        ]);
+
+        renderTrajectory(trajectory);
+        if (heatmap) renderHeatmap(heatmap);
+        if (profiles) renderProfiles(profiles);
+        renderTimeline(trajectory);
+        renderMetrics(metrics);
+        renderLogs(logs);
+      } catch (error) {
+        setStatus(error.message, true);
+      }
+    }
+
+    function renderTrajectory(payload) {
+      const truth = payload.truth || [];
+      const estimated = payload.estimated || [];
+      const events = payload.events || [];
+      const data = [];
+      if (truth.length) {
+        data.push({
+          x: truth.map(item => item.lon),
+          y: truth.map(item => item.lat),
+          type: "scatter",
+          mode: "lines",
+          name: "Truth",
+          line: { color: "#e7edf3", width: 2 }
+        });
+      }
+      if (estimated.length) {
+        data.push({
+          x: estimated.map(item => item.lon),
+          y: estimated.map(item => item.lat),
+          type: "scatter",
+          mode: "lines",
+          name: "Estimated",
+          line: { color: "#2f81f7", width: 3 }
+        });
+      }
+      for (const event of events) {
+        const point = truth.find(item => Math.abs(item.timestamp - event.timestamp) < 1e-6)
+          || estimated.find(item => Math.abs(item.timestamp - event.timestamp) < 1e-6);
+        if (!point) continue;
+        data.push({
+          x: [point.lon],
+          y: [point.lat],
+          type: "scatter",
+          mode: "markers+text",
+          name: event.type,
+          text: [event.type],
+          textposition: "top center",
+          marker: { size: 12, color: event.type === "GNSS_LOST" ? "#d29922" : "#2ea043", symbol: "diamond" }
+        });
+      }
+      Plotly.react("trajectoryPlot", data, {
+        ...plotLayoutBase,
+        title: "Truth vs Estimated Trajectory",
+        xaxis: { title: "Longitude" },
+        yaxis: { title: "Latitude" }
+      }, { responsive: true, displayModeBar: false });
+    }
+
+    function renderHeatmap(payload) {
+      Plotly.react("heatmapPlot", [
+        {
+          z: payload.values,
+          x: payload.offsets,
+          y: payload.azimuths,
+          type: "heatmap",
+          colorscale: "Viridis",
+          colorbar: { title: "corr" }
+        },
+        {
+          x: [payload.best_offset],
+          y: [payload.best_azimuth],
+          type: "scatter",
+          mode: "markers",
+          name: "Best",
+          marker: { color: "#f85149", size: 12, symbol: "star" }
+        }
+      ], {
+        ...plotLayoutBase,
+        title: `Best score ${payload.best_score == null ? "--" : payload.best_score.toFixed(3)}`,
+        xaxis: { title: "Offset, m" },
+        yaxis: { title: "Azimuth, deg" }
+      }, { responsive: true, displayModeBar: false });
+    }
+
+    function renderProfiles(payload) {
+      Plotly.react("profilesPlot", [
+        {
+          x: payload.timestamp,
+          y: payload.barometer_alt_m,
+          type: "scatter",
+          mode: "lines",
+          name: "Barometer alt",
+          line: { color: "#2f81f7", width: 2 }
+        },
+        {
+          x: payload.timestamp,
+          y: payload.radar_alt_m,
+          type: "scatter",
+          mode: "lines",
+          name: "Radar alt",
+          line: { color: "#d29922", width: 2 }
+        },
+        {
+          x: payload.timestamp,
+          y: payload.terrain_dem_m,
+          type: "scatter",
+          mode: "lines",
+          name: "Terrain DEM",
+          line: { color: "#2ea043", width: 2 }
+        },
+        {
+          x: payload.timestamp,
+          y: payload.reconstructed_terrain_m,
+          type: "scatter",
+          mode: "lines",
+          name: "Reconstructed terrain",
+          line: { color: "#f85149", width: 2, dash: "dot" }
+        }
+      ], {
+        ...plotLayoutBase,
+        title: "Altitude and Terrain Profiles",
+        xaxis: { title: "Time, s" },
+        yaxis: { title: "Height, m" }
+      }, { responsive: true, displayModeBar: false });
+    }
+
+    function renderTimeline(payload) {
+      const estimated = payload.estimated || [];
+      if (!estimated.length) {
+        Plotly.react("timelinePlot", [], { ...plotLayoutBase, title: "Replay timeline" }, { responsive: true, displayModeBar: false });
+        return;
+      }
+      api("/api/metrics").then(metrics => {
+        Plotly.react("timelinePlot", [
+          {
+            x: estimated.map(item => item.timestamp),
+            y: estimated.map(() => metrics.mean_position_error_m ?? null),
+            type: "scatter",
+            mode: "lines",
+            name: "Mean error",
+            line: { color: "#f85149", width: 2 }
+          },
+          {
+            x: estimated.map(item => item.timestamp),
+            y: estimated.map(() => metrics.average_correlation_score ?? null),
+            type: "scatter",
+            mode: "lines",
+            name: "Avg correlation",
+            yaxis: "y2",
+            line: { color: "#2ea043", width: 2 }
+          }
+        ], {
+          ...plotLayoutBase,
+          title: "Replay Error and Correlation Summary",
+          xaxis: { title: "Time, s" },
+          yaxis: { title: "Error, m" },
+          yaxis2: {
+            title: "Correlation",
+            overlaying: "y",
+            side: "right",
+            range: [0, 1]
+          }
+        }, { responsive: true, displayModeBar: false });
+      });
+    }
+
+    document.getElementById("validateBtn").addEventListener("click", validateDataset);
+    document.getElementById("loadBtn").addEventListener("click", loadDataset);
+    document.getElementById("startBtn").addEventListener("click", async () => {
+      await replayAction("/api/replay/start", { speed: Number(document.getElementById("replaySpeed").value || "1") });
+    });
+    document.getElementById("pauseBtn").addEventListener("click", () => replayAction("/api/replay/pause"));
+    document.getElementById("stopBtn").addEventListener("click", () => replayAction("/api/replay/stop"));
+    document.getElementById("backBtn").addEventListener("click", () => replayAction("/api/replay/step_backward"));
+    document.getElementById("forwardBtn").addEventListener("click", () => replayAction("/api/replay/step_forward"));
+
+    async function tick() {
+      await refreshState();
+      await refreshStaticPanels();
+    }
+
+    loadHealth();
+    tick();
+    setInterval(loadHealth, 5000);
+    setInterval(tick, 1500);
+  </script>
+</body>
+</html>

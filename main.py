@@ -159,6 +159,16 @@ class ReplayMetrics:
     azimuth_error_deg: float
 
 
+@dataclass(frozen=True)
+class PipelineArtifacts:
+    """Collected pipeline outputs for CLI, reports, and web integrations."""
+
+    history: list[tuple[int, IMMResult]]
+    metrics: ReplayMetrics | None
+    report_records: list[dict[str, Any]]
+    report_context: dict[str, Any]
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
     """Create the CLI parser for the main orchestrator."""
 
@@ -775,6 +785,60 @@ def sample_position_fix(sample: UnifiedSample, confidence: float = 1.0) -> Posit
     )
 
 
+def _sample_motion_latlon(sample: UnifiedSample) -> tuple[float | None, float | None]:
+    """Return only motion inputs that would be available to the live pipeline."""
+
+    if sample.has_position:
+        assert sample.lat is not None and sample.lon is not None
+        return float(sample.lat), float(sample.lon)
+    return None, None
+
+
+def _measurement_distance_m(samples_window: list[UnifiedSample], geod: pyproj.Geod) -> float:
+    """Estimate traveled distance across a window using positions when available."""
+
+    if len(samples_window) < 2:
+        return 0.0
+
+    position_distance_m = 0.0
+    have_position_segments = True
+    for previous, current in zip(samples_window, samples_window[1:]):
+        prev_lat, prev_lon = _sample_motion_latlon(previous)
+        cur_lat, cur_lon = _sample_motion_latlon(current)
+        if None in (prev_lat, prev_lon, cur_lat, cur_lon):
+            have_position_segments = False
+            break
+        assert prev_lat is not None and prev_lon is not None and cur_lat is not None and cur_lon is not None
+        _, _, distance_m = geod.inv(prev_lon, prev_lat, cur_lon, cur_lat)
+        position_distance_m += float(distance_m)
+    if have_position_segments and position_distance_m > 0.0:
+        return position_distance_m
+
+    integrated_distance_m = 0.0
+    for previous, current in zip(samples_window, samples_window[1:]):
+        dt = max(float(current.timestamp) - float(previous.timestamp), 0.0)
+        segment_speed = max(0.0, 0.5 * (previous.effective_speed_mps + current.effective_speed_mps))
+        integrated_distance_m += segment_speed * dt
+    return integrated_distance_m
+
+
+def _window_sampling_geometry(
+    samples_window: list[UnifiedSample],
+    config: Config,
+    geod: pyproj.Geod,
+) -> tuple[float, float, float]:
+    """Compute sampling step and profile lengths for the current window."""
+
+    interval_count = max(len(samples_window) - 1, 1)
+    distance_m = _measurement_distance_m(samples_window, geod)
+    fallback_step_m = max(config.speed_mps / max(config.freq_hz, 1e-6), 1.0)
+    step_m = distance_m / interval_count if distance_m > 0.0 else fallback_step_m
+    step_m = max(step_m, 1.0)
+    measured_profile_length_m = step_m * interval_count
+    reference_profile_length_m = measured_profile_length_m + config.max_offset_m
+    return step_m, measured_profile_length_m, reference_profile_length_m
+
+
 def pipeline_worker(
     config: Config,
     frame_queue: queue.Queue,
@@ -797,21 +861,11 @@ def pipeline_worker(
     step_dt = config.step_size / config.freq_hz
     window_duration = config.window_size / config.freq_hz
     window_counter = 0
-    measurement_step_m = config.speed_mps / config.freq_hz
-    measured_profile_length_m = config.window_size * measurement_step_m
-    reference_profile_length_m = measured_profile_length_m + config.max_offset_m
+    extractor: ProfileExtractor | None = None
+    correlator: Correlator | None = None
+    geometry_signature: tuple[float, float] | None = None
 
     with DEMLoader(config.dem_path) as dem:
-        extractor = ProfileExtractor(
-            dem,
-            profile_length_m=reference_profile_length_m,
-            step_m=measurement_step_m,
-        )
-        correlator = Correlator(
-            profile_length_m=measured_profile_length_m,
-            step_m=measurement_step_m,
-            max_offset_m=config.max_offset_m,
-        )
         solver = PositionSolver()
         imm = IMMFilter()
 
@@ -830,6 +884,24 @@ def pipeline_worker(
             samples_window = [item.sample for item in buffer]
             latest_sample = samples_window[-1]
             center_frame_index = buffer[-1].index
+            measurement_step_m, measured_profile_length_m, reference_profile_length_m = _window_sampling_geometry(
+                samples_window,
+                config,
+                geod,
+            )
+            current_signature = (round(measurement_step_m, 6), round(reference_profile_length_m, 3))
+            if extractor is None or correlator is None or geometry_signature != current_signature:
+                extractor = ProfileExtractor(
+                    dem,
+                    profile_length_m=reference_profile_length_m,
+                    step_m=measurement_step_m,
+                )
+                correlator = Correlator(
+                    profile_length_m=measured_profile_length_m,
+                    step_m=measurement_step_m,
+                    max_offset_m=config.max_offset_m,
+                )
+                geometry_signature = current_signature
             h_meas = np.array(
                 [sample.alt_msl - sample.radar_alt_m for sample in samples_window],
                 dtype=float,
@@ -905,12 +977,19 @@ def pipeline_worker(
                     {
                         "index": int(center_frame_index),
                         "timestamp": float(latest_sample.timestamp),
+                        "total_samples": None,
                         "estimated_lat": float(imm_result.lat),
                         "estimated_lon": float(imm_result.lon),
                         "truth_lat": None if truth_lat is None else float(truth_lat),
                         "truth_lon": None if truth_lon is None else float(truth_lon),
+                        "truth_alt_msl": None,
+                        "truth_heading_deg": None,
+                        "truth_speed_mps": None,
                         "estimated_speed_mps": float(imm_result.speed_mps),
                         "estimated_heading_deg": float(imm_result.azimuth_deg),
+                        "radar_alt_m": float(latest_sample.radar_alt_m),
+                        "baro_alt_m": float(latest_sample.alt_msl),
+                        "terrain_h": None if latest_sample.terrain_h is None else float(latest_sample.terrain_h),
                         "gnss_available": gnss_available,
                         "mode": primary_mode,
                         "terrain_active": primary_mode == "TERRAIN_NAV",
@@ -925,6 +1004,7 @@ def pipeline_worker(
                     latest_sample.correlation_heatmap if latest_sample.correlation_heatmap is not None else corr_result.heatmap,
                     dtype=float,
                 ).tolist()
+                report_context["correlation_step_m"] = float(measurement_step_m)
                 report_context["dem_patch"] = np.asarray(dem_patch, dtype=float).tolist()
                 report_context["dem_extent"] = {
                     "left": float(min(left, right)),
@@ -1000,6 +1080,13 @@ def _enqueue_state(state_queue: queue.Queue, payload: dict[str, Any], stop_event
 
 def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMetrics | None]:
     """Run the configured pipeline end-to-end."""
+
+    artifacts = run_pipeline_capture(config)
+    return artifacts.history, artifacts.metrics
+
+
+def run_pipeline_capture(config: Config) -> PipelineArtifacts:
+    """Run the configured pipeline and return detailed artifacts."""
 
     frame_queue: queue.Queue = queue.Queue(maxsize=1000)
     state_queue: queue.Queue = queue.Queue(maxsize=100)
@@ -1100,12 +1187,19 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
             [
                 {
                     "timestamp": float(index),
+                    "total_samples": None,
                     "estimated_lat": float(item.lat),
                     "estimated_lon": float(item.lon),
                     "truth_lat": None,
                     "truth_lon": None,
+                    "truth_alt_msl": None,
+                    "truth_heading_deg": None,
+                    "truth_speed_mps": None,
                     "estimated_speed_mps": float(item.speed_mps),
                     "estimated_heading_deg": float(item.azimuth_deg),
+                    "radar_alt_m": None,
+                    "baro_alt_m": None,
+                    "terrain_h": None,
                     "gnss_available": False,
                     "mode": str(item.dominant_mode).upper(),
                     "terrain_active": False,
@@ -1120,7 +1214,12 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
         )
     if config.auto_open_report:
         open_report_in_browser(config.report_path)
-    return pipeline_history, pipeline_metrics
+    return PipelineArtifacts(
+        history=pipeline_history,
+        metrics=pipeline_metrics,
+        report_records=list(report_records),
+        report_context=dict(report_context),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

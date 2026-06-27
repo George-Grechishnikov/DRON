@@ -5,3 +5,6 @@ terrain_nav_core/build/
 *.pyc
 output/
 terrain_navigator.log
+terrain_navigator_web.log
+frontend/node_modules/
+frontend/dist/

@@ -155,6 +155,32 @@ The report now shows whether:
 - terrain navigation mode was entered
 - final system mode is `INIT` or `TERRAIN_NAV`
 
+### 9. Security and replay-hardening pass
+
+After the initial person-2 implementation, an additional hardening pass was completed for the same ownership area.
+
+Implemented in:
+
+- `main.py`
+- `case_reader.py`
+- `web_backend.py`
+- `web_ui.html`
+- `test_web_backend.py`
+- `test_case_reader.py`
+
+What was improved:
+
+- removed truth-label leakage from variable-speed correlation geometry after GNSS loss
+- added midnight rollover handling for NMEA radar timestamps
+- corrected backend metrics so terrain-navigation dwell time is derived from final pipeline outputs
+- corrected correlation-heatmap offset labels to use the real per-window correlation step
+- stopped labeling non-truth values as `truth_*` in exported records
+- restored reference-matrix reuse to avoid unnecessary per-window recomputation
+- hardened local backend config/settings behavior so dataset loading no longer turns `/api/settings` into arbitrary YAML read/write
+- added protected local control session behavior for mutating web API calls
+
+This moved the person-2 area closer to a realistic engineering handoff state rather than only a demo state.
+
 ### 8. Stability fix for DEM boundary processing
 
 During a long real-case run, a crash was found at the DEM boundary due to geodesic sampling touching the exact raster edge.
@@ -214,6 +240,11 @@ Result:
 
 - `30 passed`
 
+Additional full-project verification after hardening:
+
+- `61 passed`
+- `1 skipped`
+
 ### Case validation
 
 Validated config-driven case input parsing using:
@@ -236,6 +267,14 @@ Also observed:
 
 - the exhaustive correlation mode is still computationally heavy on the 50k input set
 - current implementation is functionally ready, but full-length "combat" processing of very large inputs should be optimized further
+
+## Remaining Limits
+
+The remaining limits in the person-2 area are mostly operational rather than functional:
+
+- `web_backend.py` is intentionally still a localhost engineering backend, not a public production backend
+- very long replay runs can still be computationally heavy because exhaustive terrain correlation remains expensive
+- future `sitl_bridge.py` integration should reuse the unified sample contract and avoid reintroducing truth-dependent runtime behavior after GNSS loss
 
 ## What the User Gets Now
 

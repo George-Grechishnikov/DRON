@@ -72,6 +72,24 @@ python3 -m venv .venv
 .venv/bin/python case_runner.py --config input/incoming/config.yaml
 ```
 
+Если нужен локальный веб-интерфейс с backend API и replay-управлением:
+
+```bash
+.venv/bin/python -m uvicorn web_backend:app --host 127.0.0.1 --port 8000
+```
+
+После запуска открывай:
+
+```text
+http://127.0.0.1:8000
+```
+
+Важно:
+
+- этот backend рассчитан на локальный инженерный запуск на `127.0.0.1`
+- state-changing API защищены локальной browser-origin проверкой и session token
+- не нужно публиковать этот backend наружу без отдельного production auth/reverse proxy слоя
+
 Пример:
 
 ```bash
@@ -136,6 +154,22 @@ input/
 Готовый шаблон уже добавлен в репозиторий.
 
 ## Что уже умеет проект
+
+### Локальный web backend
+
+`web_backend.py` умеет:
+
+- загружать case-датасет из `config.yaml`
+- валидировать DEM / NMEA / truth / barometer входы
+- запускать replay через тот же pipeline
+- отдавать trajectory / heatmap / profiles / metrics / logs
+- защищать mutating API локальной session-защитой для UI
+
+Что важно понимать:
+
+- это локальный инженерный backend, а не интернет-facing production service
+- для UI достаточно открыть `/`, токен сессии встраивается в HTML автоматически
+- для внешних браузерных запросов mutating endpoints требуют и допустимый local origin, и session token
 
 ### 1. Генерация синтетического NMEA
 

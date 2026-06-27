@@ -5,11 +5,14 @@ import queue
 import threading
 
 import numpy as np
+import pyproj
+import pytest
 
 from imm_filter import IMMResult
 from main import (
     GroundTruthPoint,
     UnifiedSample,
+    _window_sampling_geometry,
     coerce_unified_sample,
     compute_replay_metrics,
     load_unified_samples_jsonl,
@@ -216,6 +219,55 @@ def test_unified_sample_producer_enqueues_bridge_dicts() -> None:
     assert packet.index == 0
     assert packet.sample.lat == 60.5
     assert packet.sample.gnss_available is True
+
+
+def test_window_sampling_geometry_uses_window_motion_instead_of_config_speed() -> None:
+    geod = pyproj.Geod(ellps="WGS84")
+    lon0, lat0 = 90.3, 60.5
+    lon1, lat1, _ = geod.fwd(lon0, lat0, 45.0, 12.0)
+    lon2, lat2, _ = geod.fwd(lon1, lat1, 45.0, 18.0)
+    samples = [
+        UnifiedSample(
+            timestamp_s=0.0,
+            lat=lat0,
+            lon=lon0,
+            alt_msl=1500.0,
+            radar_alt_m=1200.0,
+            heading_deg=45.0,
+            speed_mps=60.0,
+            truth_lat=lat0,
+            truth_lon=lon0,
+        ),
+        UnifiedSample(
+            timestamp_s=1.0,
+            lat=lat1,
+            lon=lon1,
+            alt_msl=1500.0,
+            radar_alt_m=1199.0,
+            heading_deg=45.0,
+            speed_mps=12.0,
+            truth_lat=lat1,
+            truth_lon=lon1,
+        ),
+        UnifiedSample(
+            timestamp_s=2.0,
+            lat=lat2,
+            lon=lon2,
+            alt_msl=1500.0,
+            radar_alt_m=1198.0,
+            heading_deg=45.0,
+            speed_mps=18.0,
+            truth_lat=lat2,
+            truth_lon=lon2,
+        ),
+    ]
+    config = parse_args(["--sim", "--dem", "data/dem.tif", "--speed", "50", "--freq", "1"])
+
+    step_m, measured_profile_length_m, reference_profile_length_m = _window_sampling_geometry(samples, config, geod)
+
+    assert step_m == pytest.approx(15.0, abs=0.5)
+    assert measured_profile_length_m == pytest.approx(30.0, abs=1.0)
+    assert reference_profile_length_m == pytest.approx(30.0 + config.max_offset_m, abs=1.0)
 
 
 def test_load_unified_samples_jsonl_skips_blank_lines(tmp_path: Path) -> None:

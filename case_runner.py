@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from case_reader import CaseInputConfig, iter_case_unified_samples
 from main import _path_from_config, load_yaml_config, main as run_main
 
 
@@ -19,7 +20,7 @@ def _report_paths(report_path: Path) -> dict[str, Path]:
     }
 
 
-def _validate_case_inputs(config_path: Path) -> tuple[dict[str, Path], Path]:
+def _validate_case_inputs(config_path: Path) -> tuple[dict[str, Path], Path, dict]:
     payload = load_yaml_config(config_path)
     required = {
         "dem_path": _path_from_config(payload, "dem_path", config_path),
@@ -35,7 +36,26 @@ def _validate_case_inputs(config_path: Path) -> tuple[dict[str, Path], Path]:
     visualization = payload.get("visualization", {}) if isinstance(payload.get("visualization"), dict) else {}
     report_path_value = visualization.get("export_report_path", "output/terrain_navigator_report.html")
     report_path = Path(str(report_path_value))
-    return {key: Path(value) for key, value in required.items() if value is not None}, report_path
+    return {key: Path(value) for key, value in required.items() if value is not None}, report_path, payload
+
+
+def _fully_validate_case_payload(payload: dict, resolved_inputs: dict[str, Path]) -> int:
+    frequency_hz = float(payload.get("sample_rate_hz", payload.get("frequency_hz", 0.0)))
+    if frequency_hz <= 0:
+        raise ValueError("config.yaml must define a positive sample_rate_hz or frequency_hz")
+    gnss_drop_after = payload.get("gnss_drop_after_s")
+    case_config = CaseInputConfig(
+        dem_path=resolved_inputs["dem_path"],
+        radar_data_path=resolved_inputs["radar_data_path"],
+        truth_path=resolved_inputs["truth_path"],
+        barometer_path=resolved_inputs["barometer_path"],
+        sample_rate_hz=frequency_hz,
+        gnss_drop_after_s=None if gnss_drop_after is None else float(gnss_drop_after),
+    )
+    sample_count = sum(1 for _ in iter_case_unified_samples(case_config))
+    if sample_count <= 0:
+        raise ValueError("case input set is empty after parsing")
+    return sample_count
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -50,11 +70,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--validate-only", action="store_true", help="Validate case inputs without running the pipeline")
     args = parser.parse_args(argv)
 
-    resolved_inputs, report_path = _validate_case_inputs(args.config)
+    resolved_inputs, report_path, payload = _validate_case_inputs(args.config)
     if args.validate_only:
+        sample_count = _fully_validate_case_payload(payload, resolved_inputs)
         print("Case inputs validated:")
         for name, path in resolved_inputs.items():
             print(f"  {name}: {path}")
+        print(f"  parsed_samples: {sample_count}")
         print(f"  report_path: {report_path}")
         return 0
 
