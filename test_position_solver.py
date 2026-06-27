@@ -41,12 +41,13 @@ def test_solve_matches_geodetic_forward_solution() -> None:
         start_lat=60.5,
         start_lon=90.3,
         window_duration_s=10.0,
+        measurement_span_m=0.0,
     )
     expected_lon, expected_lat, _ = geod.fwd(90.3, 60.5, 45.0, 1500.0)
 
     assert np.isclose(fix.lat, expected_lat, atol=1e-7)
     assert np.isclose(fix.lon, expected_lon, atol=1e-7)
-    assert np.isclose(fix.speed_mps, 150.0)
+    assert np.isclose(fix.speed_mps, 0.0)
     assert fix.azimuth_deg == 45.0
     assert fix.cov_matrix.shape == (2, 2)
 
@@ -96,7 +97,7 @@ def test_history_keeps_last_ten_fixes() -> None:
     result = _make_result(azimuth_deg=30.0, offset_m=300.0)
 
     for _ in range(12):
-        solver.solve(result, start_lat=60.5, start_lon=90.3, window_duration_s=10.0)
+        solver.solve(result, start_lat=60.5, start_lon=90.3, window_duration_s=10.0, measurement_span_m=0.0)
 
     track = solver.get_track()
     assert len(track) == 10
@@ -111,17 +112,39 @@ def test_second_fix_derives_motion_from_previous_fix() -> None:
         start_lat=60.5,
         start_lon=90.3,
         window_duration_s=10.0,
+        measurement_span_m=500.0,
     )
     second = solver.solve(
         _make_result(azimuth_deg=45.0, offset_m=500.0),
         start_lat=first.lat,
         start_lon=first.lon,
         window_duration_s=10.0,
+        measurement_span_m=500.0,
     )
 
-    assert np.isclose(second.speed_mps, 50.0, atol=1e-6)
-    assert np.isclose(second.azimuth_deg, 45.0, atol=1e-6)
+    assert np.isclose(second.speed_mps, 100.0, atol=1e-6)
+    assert np.isclose(second.azimuth_deg, 45.0, atol=1e-2)
     assert np.isclose(second.timestamp_s - first.timestamp_s, 10.0, atol=1e-9)
+
+
+def test_solve_can_return_end_of_window_fix_from_matched_origin() -> None:
+    geod = pyproj.Geod(ellps="WGS84")
+    solver = PositionSolver(geod=geod)
+    result = _make_result(azimuth_deg=45.0, offset_m=100.0)
+
+    fix = solver.solve(
+        result,
+        start_lat=60.5,
+        start_lon=90.3,
+        window_duration_s=10.0,
+        measurement_span_m=400.0,
+    )
+    matched_lon, matched_lat, _ = geod.fwd(90.3, 60.5, 45.0, 100.0)
+    expected_lon, expected_lat, _ = geod.fwd(matched_lon, matched_lat, 45.0, 400.0)
+
+    assert np.isclose(fix.lat, expected_lat, atol=1e-7)
+    assert np.isclose(fix.lon, expected_lon, atol=1e-7)
+    assert np.isclose(fix.speed_mps, 40.0, atol=1e-9)
 
 
 def test_position_covariance_is_anisotropic_and_rotated_by_azimuth() -> None:

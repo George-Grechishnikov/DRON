@@ -108,6 +108,23 @@ In another terminal:
 python .\main.py --live --dem .\data\fabdem_canberra.tif --udp-host 127.0.0.1 --udp-port 10110
 ```
 
+For an even stricter file-based case demo where `main.py` receives an explicit `NMEA GPGGA` log together with the `DEM`, use:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_case_nmea_demo.ps1
+```
+
+This script does two steps automatically:
+
+1. generates a real `GPGGA` radar-altimeter `.nmea` file;
+2. starts `main.py --replay --dem ... --nmea ... --gt ...`.
+
+Recommended real DEM for Canberra/SITL:
+
+- `data/fabdem_canberra_wide.tif` - merged real `FABDEM` cutout around Canberra and nearby mountains
+- bounds: `148.15 .. 149.45 lon`, `-35.90 .. -35.00 lat`
+- elevation span: about `216 .. 1906 m`
+
 ## SITL bridge
 
 `sitl_bridge.py` is the dedicated bridge layer for `ArduPilot SITL`.

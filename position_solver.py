@@ -62,6 +62,8 @@ class PositionSolver:
         start_lat: float,
         start_lon: float,
         window_duration_s: float,
+        update_dt_s: float | None = None,
+        measurement_span_m: float = 0.0,
     ) -> PositionEstimate:
         """Convert the best azimuth and offset into a geodetic position fix."""
 
@@ -74,6 +76,8 @@ class PositionSolver:
             start_lat=start_lat,
             start_lon=start_lon,
             window_duration_s=window_duration_s,
+            update_dt_s=update_dt_s,
+            measurement_span_m=measurement_span_m,
             prev_fix=previous_fix,
         )
         self._history.append(fix)
@@ -85,23 +89,39 @@ class PositionSolver:
         start_lat: float,
         start_lon: float,
         window_duration_s: float,
+        update_dt_s: float | None,
+        measurement_span_m: float,
         prev_fix: PositionEstimate | None,
     ) -> PositionEstimate:
         """Convert correlation output into a fix, deriving motion from sequential fixes when possible."""
 
         if window_duration_s <= 0:
             raise ValueError("window_duration_s must be positive")
+        if measurement_span_m < 0:
+            raise ValueError("measurement_span_m must be non-negative")
 
         azimuth_deg = normalize_azimuth_deg(result.best_azimuth_deg)
-        end_lon, end_lat, _ = self.geod.fwd(
+        offset_m = (
+            result.best_offset_subsample_m
+            if np.isfinite(result.best_offset_subsample_m)
+            and (result.best_offset_m == 0.0 or result.best_offset_subsample_m > 0.0)
+            else result.best_offset_m
+        )
+        origin_lon, origin_lat, _ = self.geod.fwd(
             start_lon,
             start_lat,
             azimuth_deg,
-            result.best_offset_m,
+            offset_m,
         )
-        speed_mps = result.best_offset_m / window_duration_s
+        end_lon, end_lat, _ = self.geod.fwd(
+            origin_lon,
+            origin_lat,
+            azimuth_deg,
+            measurement_span_m,
+        )
+        speed_mps = measurement_span_m / window_duration_s
         timestamp_s = (
-            prev_fix.timestamp_s + window_duration_s
+            prev_fix.timestamp_s + (float(update_dt_s) if update_dt_s is not None else window_duration_s)
             if prev_fix is not None
             else float(time.time())
         )

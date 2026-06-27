@@ -221,7 +221,7 @@ class DEMLoader:
             lat_array = lat_array.reshape(-1)
             lon_array = lon_array.reshape(-1)
 
-        rows, cols = (~self._raster.transform) * (lon_array, lat_array)
+        cols, rows = (~self._raster.transform) * (lon_array, lat_array)
         rows = np.asarray(rows, dtype=float)
         cols = np.asarray(cols, dtype=float)
         valid = (

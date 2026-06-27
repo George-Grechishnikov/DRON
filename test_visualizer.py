@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import queue
+import time
 from pathlib import Path
 
 import numpy as np
 
 from correlator import CorrelationResult
 from imm_filter import IMMResult
-from visualizer import TerrainNavigatorDash, create_arrow_shape, export_flight_report
+from visualizer import (
+    TerrainNavigatorDash,
+    build_velocity_annotation,
+    create_arrow_shape,
+    create_probability_ellipse_traces,
+    export_flight_report,
+)
 
 
 def _fake_corr() -> CorrelationResult:
@@ -42,7 +49,7 @@ def _fake_fix() -> IMMResult:
     )
 
 
-def test_update_all_panels_returns_four_figures_and_store() -> None:
+def test_update_all_panels_returns_figures_and_store() -> None:
     state_queue: queue.Queue = queue.Queue()
     dash_app = TerrainNavigatorDash(state_queue=state_queue)
     state_queue.put(
@@ -52,6 +59,7 @@ def test_update_all_panels_returns_four_figures_and_store() -> None:
             "h_meas": np.array([101.0, 107.0, 102.0], dtype=float),
             "ref": np.array([100.0, 105.0, 103.0], dtype=float),
             "dem_patch": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=float),
+            "dem_patch_transform": (0.001, 0.0, 90.299, 0.0, -0.001, 60.501),
             "hdop": 12.0,
             "nav_mode": "terrain_update_accepted",
             "used_prediction_only": False,
@@ -69,6 +77,15 @@ def test_update_all_panels_returns_four_figures_and_store() -> None:
                 "efficiency_hint": 0.42,
                 "is_informative": True,
             },
+            "event_ingest_monotonic_s": time.perf_counter() - 0.05,
+            "pipeline_emitted_monotonic_s": time.perf_counter() - 0.02,
+            "pipeline_latency_ms": 50.0,
+            "integrity_status": "OK",
+            "runtime_stats": {
+                "frame_drop_count": 0,
+                "state_queue_replacements": 0,
+                "state_payloads_enqueued": 1,
+            },
         }
     )
 
@@ -78,20 +95,92 @@ def test_update_all_panels_returns_four_figures_and_store() -> None:
     )
 
     assert len(heatmap_fig.data) >= 2
-    assert len(terrain_fig.data) >= 4
+    assert len(terrain_fig.data) >= 6
     assert len(profiles_fig.data) >= 2
     assert len(telemetry_fig.data) >= 2
     assert len(store["history"]) == 1
-    assert any("Nav mode" in annotation["text"] for annotation in telemetry_fig.layout.annotations)
-    assert any("Window size" in annotation["text"] for annotation in telemetry_fig.layout.annotations)
+    assert "latest_state" in store
+    assert any("Режим навигации" in annotation["text"] for annotation in telemetry_fig.layout.annotations)
+    assert any("Размер окна" in annotation["text"] for annotation in telemetry_fig.layout.annotations)
     assert any("GNSS" in annotation["text"] for annotation in telemetry_fig.layout.annotations)
     assert any("CRLB" in annotation["text"] for annotation in telemetry_fig.layout.annotations)
+    assert any("Измеренный профиль" in str(trace.name) for trace in profiles_fig.data)
+    assert any("Остаток" in str(trace.name) for trace in profiles_fig.data)
+    assert any("Зона вероятности" in str(trace.name) for trace in terrain_fig.data)
+    assert any("Скорость:" in annotation["text"] for annotation in terrain_fig.layout.annotations)
+    assert "reaction_latency_ms" in store["latest_state"]
+    assert "runtime_stats" in store["latest_state"]
+    assert min(terrain_fig.data[0]["x"]) > 90.0
+    assert min(terrain_fig.data[0]["y"]) > 60.0
+
+
+def test_metrics_panel_can_be_rebuilt_from_store_summary() -> None:
+    state_queue: queue.Queue = queue.Queue()
+    dash_app = TerrainNavigatorDash(state_queue=state_queue)
+    state_queue.put(
+        {
+            "corr": _fake_corr(),
+            "fix": _fake_fix(),
+            "h_meas": np.array([101.0, 107.0, 102.0], dtype=float),
+            "ref": np.array([100.0, 105.0, 103.0], dtype=float),
+            "dem_patch": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=float),
+            "dem_patch_transform": (0.001, 0.0, 90.299, 0.0, -0.001, 60.501),
+            "hdop": 12.0,
+            "nav_mode": "terrain_update_accepted",
+            "used_prediction_only": False,
+            "selected_window_size": 40,
+            "gnss_available": False,
+            "truth": {
+                "lat": 60.5002,
+                "lon": 90.3003,
+                "heading_deg": 44.0,
+                "speed_mps": 52.0,
+            },
+            "observability": {
+                "crlb_m": 42.0,
+                "gradient_energy": 1.3,
+                "efficiency_hint": 0.42,
+                "is_informative": True,
+            },
+            "event_ingest_monotonic_s": time.perf_counter() - 0.05,
+            "pipeline_emitted_monotonic_s": time.perf_counter() - 0.02,
+            "pipeline_latency_ms": 50.0,
+            "integrity_status": "OK",
+            "runtime_stats": {
+                "frame_drop_count": 0,
+                "state_queue_replacements": 0,
+                "state_payloads_enqueued": 1,
+            },
+        }
+    )
+
+    _, _, _, _, store = dash_app.update_all_panels(1, {"history": []})
+    metrics_panel = dash_app._build_metrics_panel(store["latest_state"])
+
+    values = [str(card.children[0].children) for card in metrics_panel]
+    assert len(metrics_panel) >= 8
+    assert "Задержка реакции" in values
+    assert "Целостность" in values
 
 
 def test_create_arrow_shape_returns_three_segments() -> None:
     shapes = create_arrow_shape(60.5, 90.3, 45.0)
     assert len(shapes) == 3
     assert all(shape["type"] == "line" for shape in shapes)
+
+
+def test_create_probability_ellipse_traces_returns_two_filled_contours() -> None:
+    traces = create_probability_ellipse_traces(60.5, 90.3, _fake_fix().covariance)
+
+    assert len(traces) == 2
+    assert all(trace.fill == "toself" for trace in traces)
+
+
+def test_build_velocity_annotation_includes_speed_and_heading() -> None:
+    text = build_velocity_annotation(_fake_fix())
+
+    assert "Скорость:" in text
+    assert "Курс:" in text
 
 
 def test_export_flight_report_writes_html(tmp_path: Path) -> None:

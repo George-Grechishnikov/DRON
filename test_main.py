@@ -7,9 +7,24 @@ import numpy as np
 
 from constants import FIXED_BARO_ALTITUDE_M
 from imm_filter import IMMResult
-from main import Config, GroundTruthPoint, build_window_sizes, choose_navigation_fix, compute_replay_metrics, parse_args
+from main import (
+    Config,
+    GroundTruthPoint,
+    ReacquisitionTracker,
+    WindowSelection,
+    build_turn_probe_window_sizes,
+    build_window_sizes,
+    choose_navigation_fix,
+    compute_replay_metrics,
+    maybe_select_turn_transition_window,
+    maybe_trim_turn_transition_tail,
+    maybe_update_heading_from_correlation,
+    parse_args,
+    update_reacquisition_tracker,
+)
 from position_solver import PositionEstimate
 from correlator import CorrelationResult, ObservabilityMetrics
+from measurement_layer import BaroTrack
 
 
 class StubSolver:
@@ -23,8 +38,10 @@ class StubSolver:
         start_lat: float,
         start_lon: float,
         window_duration_s: float,
+        update_dt_s: float | None = None,
+        measurement_span_m: float = 0.0,
     ) -> PositionEstimate:
-        del result, start_lat, start_lon, window_duration_s
+        del result, start_lat, start_lon, window_duration_s, update_dt_s, measurement_span_m
         self.called = True
         return self.fix
 
@@ -172,6 +189,110 @@ def test_build_window_sizes_expands_candidates_when_adaptive_is_enabled() -> Non
     assert sizes == [20, 30, 40, 50]
 
 
+def test_build_turn_probe_window_sizes_includes_short_tail() -> None:
+    sizes = build_turn_probe_window_sizes(_config(), available_frames=60)
+
+    assert sizes == [20, 30, 40]
+
+
+def test_maybe_select_turn_transition_window_prefers_short_tail_for_ambiguous_base() -> None:
+    config = _config()
+    base = WindowSelection(
+        frame_packets=[],
+        window_size=50,
+        corr_result=_corr(
+            is_ambiguous=True,
+            confidence=0.02,
+            pslr_db=0.4,
+            azimuth_deg=18.0,
+            peak_correlation=0.90,
+        ),
+        observability=_obs(),
+        flat=False,
+    )
+    short_tail = WindowSelection(
+        frame_packets=[],
+        window_size=20,
+        corr_result=_corr(
+            is_ambiguous=False,
+            confidence=0.09,
+            pslr_db=3.8,
+            azimuth_deg=46.0,
+            peak_correlation=0.89,
+        ),
+        observability=_obs(),
+        flat=False,
+    )
+
+    selected = maybe_select_turn_transition_window(config, [base, short_tail], current_azimuth_deg=0.0)
+
+    assert selected == short_tail
+
+
+def test_maybe_select_turn_transition_window_keeps_base_when_short_tail_is_not_better() -> None:
+    config = _config()
+    base = WindowSelection(
+        frame_packets=[],
+        window_size=50,
+        corr_result=_corr(
+            is_ambiguous=True,
+            confidence=0.02,
+            pslr_db=0.4,
+            azimuth_deg=18.0,
+            peak_correlation=0.90,
+        ),
+        observability=_obs(),
+        flat=False,
+    )
+    weak_short_tail = WindowSelection(
+        frame_packets=[],
+        window_size=20,
+        corr_result=_corr(
+            is_ambiguous=False,
+            confidence=0.02,
+            pslr_db=0.7,
+            azimuth_deg=21.0,
+            peak_correlation=0.82,
+        ),
+        observability=_obs(),
+        flat=False,
+    )
+
+    selected = maybe_select_turn_transition_window(config, [base, weak_short_tail], current_azimuth_deg=0.0)
+
+    assert selected is None
+
+
+def test_maybe_trim_turn_transition_tail_returns_none_when_window_is_not_suspicious() -> None:
+    selection = WindowSelection(
+        frame_packets=[],
+        window_size=50,
+        corr_result=_corr(
+            is_ambiguous=False,
+            confidence=0.12,
+            pslr_db=5.0,
+            azimuth_deg=3.0,
+            peak_correlation=0.92,
+        ),
+        observability=_obs(),
+        flat=False,
+    )
+
+    selected = maybe_trim_turn_transition_tail(
+        config=_config(),
+        selection=selection,
+        correlator=None,  # type: ignore[arg-type]
+        ref_matrix=np.empty((0, 0), dtype=float),
+        azimuths_deg=np.empty((0,), dtype=float),
+        baro_track=BaroTrack(default_msl_m=FIXED_BARO_ALTITUDE_M),
+        terrain_bias_m=0.0,
+        measurement_step_m=10.0,
+        current_azimuth_deg=0.0,
+    )
+
+    assert selected is None
+
+
 def _config() -> Config:
     return Config(
         mode="sim",
@@ -200,23 +321,40 @@ def _config() -> Config:
     )
 
 
-def _corr(*, is_reliable: bool = True, is_ambiguous: bool = False, confidence: float = 0.8) -> CorrelationResult:
+def _corr(
+    *,
+    is_reliable: bool = True,
+    is_ambiguous: bool = False,
+    confidence: float = 0.8,
+    pslr_db: float = 7.0,
+    azimuth_deg: float = 45.0,
+    peak_correlation: float = 0.9,
+) -> CorrelationResult:
     return CorrelationResult(
-        best_azimuth_deg=45.0,
+        best_azimuth_deg=azimuth_deg,
         best_offset_steps=10,
         best_offset_m=300.0,
         best_offset_subsample_steps=10.2,
         best_offset_subsample_m=306.0,
-        peak_correlation=0.9,
+        peak_correlation=peak_correlation,
         confidence=confidence,
         is_reliable=is_reliable,
-        pslr_db=7.0,
+        pslr_db=pslr_db,
         ambiguity_peak_count=1 if not is_ambiguous else 3,
         peak_isolation_m=300.0,
         is_ambiguous=is_ambiguous,
         heatmap=np.array([[0.2, 0.9]], dtype=float),
-        azimuths_deg=np.array([45.0], dtype=float),
+        azimuths_deg=np.array([azimuth_deg], dtype=float),
         best_reference_profile=np.ones((8,), dtype=float),
+    )
+
+
+def _obs(*, is_informative: bool = True, efficiency_hint: float = 0.7) -> ObservabilityMetrics:
+    return ObservabilityMetrics(
+        crlb_m=4.0,
+        efficiency_hint=efficiency_hint,
+        gradient_energy=0.2,
+        is_informative=is_informative,
     )
 
 
@@ -245,6 +383,7 @@ def test_choose_navigation_fix_uses_solver_when_terrain_update_is_accepted() -> 
         current_speed=50.0,
         current_azimuth=45.0,
         window_duration=10.0,
+        measurement_span_m=490.0,
         window_counter=5,
         flat=False,
         observability=ObservabilityMetrics(crlb_m=50.0, gradient_energy=2.0, efficiency_hint=0.4, is_informative=True),
@@ -268,6 +407,7 @@ def test_choose_navigation_fix_falls_back_when_terrain_is_ambiguous() -> None:
         current_speed=50.0,
         current_azimuth=45.0,
         window_duration=10.0,
+        measurement_span_m=490.0,
         window_counter=5,
         flat=False,
         observability=ObservabilityMetrics(crlb_m=50.0, gradient_energy=2.0, efficiency_hint=0.4, is_informative=True),
@@ -291,6 +431,7 @@ def test_choose_navigation_fix_falls_back_when_terrain_is_uninformative() -> Non
         current_speed=50.0,
         current_azimuth=45.0,
         window_duration=10.0,
+        measurement_span_m=490.0,
         window_counter=5,
         flat=False,
         observability=ObservabilityMetrics(
@@ -318,6 +459,7 @@ def test_navigation_decision_can_mark_degraded_fallback_mode() -> None:
         current_speed=50.0,
         current_azimuth=45.0,
         window_duration=10.0,
+        measurement_span_m=490.0,
         window_counter=5,
         flat=True,
         observability=ObservabilityMetrics(
@@ -330,3 +472,71 @@ def test_navigation_decision_can_mark_degraded_fallback_mode() -> None:
 
     assert decision.used_prediction_only is True
     assert decision.fix.is_reliable is False
+
+
+def test_ambiguous_turn_transition_keeps_prediction_heading_when_pslr_is_low() -> None:
+    corr = _corr(is_ambiguous=True, confidence=0.05)
+    corr = CorrelationResult(
+        **{
+            **corr.__dict__,
+            "best_azimuth_deg": 92.0,
+            "best_offset_m": 120.0,
+            "best_offset_subsample_m": 125.0,
+            "pslr_db": 0.3,
+            "ambiguity_peak_count": 3,
+        }
+    )
+
+    hinted = maybe_update_heading_from_correlation(
+        current_azimuth_deg=45.0,
+        corr_result=corr,
+        max_offset_m=2000.0,
+        selected_window_size=30,
+        measurement_step_m=10.0,
+        used_prediction_only=True,
+    )
+
+    assert hinted == 45.0
+
+
+def test_reacquisition_waits_for_two_stable_clean_windows_after_ambiguity() -> None:
+    tracker = ReacquisitionTracker(pending=True)
+    obs = ObservabilityMetrics(crlb_m=50.0, gradient_energy=2.0, efficiency_hint=0.4, is_informative=True)
+    corr_first = CorrelationResult(
+        **{
+            **_corr().__dict__,
+            "best_azimuth_deg": 82.0,
+            "best_offset_m": 240.0,
+            "best_offset_subsample_m": 245.0,
+            "pslr_db": 4.5,
+            "confidence": 0.2,
+        }
+    )
+    tracker, hold_first = update_reacquisition_tracker(
+        tracker,
+        corr_result=corr_first,
+        observability=obs,
+        flat=False,
+        max_offset_m=2000.0,
+    )
+    assert hold_first is True
+    assert tracker.pending is True
+    assert tracker.stable_windows == 1
+
+    corr_second = CorrelationResult(
+        **{
+            **corr_first.__dict__,
+            "best_azimuth_deg": 86.0,
+            "best_offset_subsample_m": 255.0,
+        }
+    )
+    tracker, hold_second = update_reacquisition_tracker(
+        tracker,
+        corr_result=corr_second,
+        observability=obs,
+        flat=False,
+        max_offset_m=2000.0,
+    )
+    assert hold_second is False
+    assert tracker.pending is False
+    assert tracker.stable_windows == 0

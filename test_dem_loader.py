@@ -57,6 +57,7 @@ def test_get_profile_along_azimuth_returns_1d_profile() -> None:
     assert profile.ndim == 1
     assert profile.shape == (5,)
     assert np.all(np.diff(profile) > 0)
+    assert np.isfinite(profile[0])
 
 
 def test_sample_points_matches_scalar_sampling_for_multiple_points() -> None:
@@ -121,3 +122,25 @@ def test_get_patch_returns_array_and_transform() -> None:
     assert patch.ndim == 2
     assert patch.size > 0
     assert hasattr(transform, "a")
+
+
+def test_get_profile_along_azimuth_starts_with_local_elevation() -> None:
+    memfile = _build_memory_dem()
+    try:
+        with DEMLoader(memfile.name) as dem:
+            center_lat = 49.5
+            center_lon = 10.5
+            elevation = dem.get_elevation(center_lat, center_lon)
+            profile = dem.get_profile_along_azimuth(
+                lat=center_lat,
+                lon=center_lon,
+                azimuth_deg=45.0,
+                distance_m=300.0,
+                step_m=30.0,
+            )
+    finally:
+        memfile.close()
+
+    assert profile.size >= 2
+    assert np.isfinite(profile[0])
+    assert abs(float(profile[0]) - float(elevation)) < 1e-6

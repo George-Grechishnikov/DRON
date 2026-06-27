@@ -11,7 +11,7 @@ import signal
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, List
 
@@ -85,6 +85,7 @@ class FramePacket:
     truth_lon: float | None = None
     truth_heading_deg: float | None = None
     truth_speed_mps: float | None = None
+    ingest_monotonic_s: float = field(default_factory=time.perf_counter)
 
 
 @dataclass(frozen=True)
@@ -120,11 +121,32 @@ class NavigationDecision:
 
 
 @dataclass(frozen=True)
+class ReacquisitionTracker:
+    """Track post-ambiguity terrain reacquisition before accepting a new fix."""
+
+    pending: bool = False
+    stable_windows: int = 0
+    last_azimuth_deg: float | None = None
+    last_offset_m: float | None = None
+
+
+@dataclass(frozen=True)
 class WindowSelection:
     """Selected processing window and its diagnostics."""
 
     frame_packets: list[FramePacket]
     window_size: int
+    corr_result: CorrelationResult
+    observability: ObservabilityMetrics
+    flat: bool
+
+
+@dataclass(frozen=True)
+class LocalReacquisitionResult:
+    """Best local terrain candidate around the predicted start position."""
+
+    start_lat: float
+    start_lon: float
     corr_result: CorrelationResult
     observability: ObservabilityMetrics
     flat: bool
@@ -409,13 +431,16 @@ def simulation_producer(
     config: Config,
     frame_queue: queue.Queue,
     stop_event: threading.Event,
+    control_queue: queue.Queue | None = None,
 ) -> list[GroundTruthPoint]:
     """Produce NMEA frames from the simulation generator."""
 
     points = make_simulation_points(config)
+    gnss_override: bool | None = None
     for point in points:
         if stop_event.is_set():
             break
+        gnss_override = _drain_manual_gnss_override(control_queue, gnss_override)
         frame = parse_line(format_gpgga(point.timestamp_s, point.radar_alt_measured))
         if frame is None:
             continue
@@ -424,7 +449,7 @@ def simulation_producer(
             FramePacket(
                 index=point.index,
                 frame=frame,
-                gnss_available=True,
+                gnss_available=True if gnss_override is None else bool(gnss_override),
                 truth_lat=point.lat,
                 truth_lon=point.lon,
             ),
@@ -437,6 +462,7 @@ def replay_producer(
     config: Config,
     frame_queue: queue.Queue,
     stop_event: threading.Event,
+    control_queue: queue.Queue | None = None,
 ) -> None:
     """Produce frames from a recorded NMEA log."""
 
@@ -444,10 +470,20 @@ def replay_producer(
     reader = NMEAReader.from_file(config.nmea_path)
     try:
         valid_index = 0
+        gnss_override: bool | None = None
         for frame in reader:
             if stop_event.is_set():
                 break
-            enqueue_frame(frame_queue, FramePacket(index=valid_index, frame=frame, gnss_available=True), stop_event)
+            gnss_override = _drain_manual_gnss_override(control_queue, gnss_override)
+            enqueue_frame(
+                frame_queue,
+                FramePacket(
+                    index=valid_index,
+                    frame=frame,
+                    gnss_available=True if gnss_override is None else bool(gnss_override),
+                ),
+                stop_event,
+            )
             if frame.valid:
                 valid_index += 1
     finally:
@@ -458,17 +494,28 @@ def live_producer(
     config: Config,
     frame_queue: queue.Queue,
     stop_event: threading.Event,
+    control_queue: queue.Queue | None = None,
 ) -> None:
     """Produce frames from a live UDP stream."""
 
     reader = NMEAReader.from_udp(config.udp_host, config.udp_port)
     valid_index = 0
+    gnss_override: bool | None = None
     try:
         while not stop_event.is_set():
             got_frame = False
             for frame in reader:
                 got_frame = True
-                enqueue_frame(frame_queue, FramePacket(index=valid_index, frame=frame, gnss_available=True), stop_event)
+                gnss_override = _drain_manual_gnss_override(control_queue, gnss_override)
+                enqueue_frame(
+                    frame_queue,
+                    FramePacket(
+                        index=valid_index,
+                        frame=frame,
+                        gnss_available=True if gnss_override is None else bool(gnss_override),
+                    ),
+                    stop_event,
+                )
                 if frame.valid:
                     valid_index += 1
             if not got_frame:
@@ -533,6 +580,24 @@ def _drain_sitl_control_queue(bridge: SITLBridge, control_queue: queue.Queue | N
             bridge.set_gnss_enabled(bool(command.get("enabled", True)))
 
 
+def _drain_manual_gnss_override(
+    control_queue: queue.Queue | None,
+    current_override: bool | None,
+) -> bool | None:
+    """Consume UI commands and keep the latest manual GNSS state for non-SITL modes."""
+
+    if control_queue is None:
+        return current_override
+    updated_override = current_override
+    while True:
+        try:
+            command = control_queue.get_nowait()
+        except queue.Empty:
+            return updated_override
+        if command.get("type") == "set_gnss_enabled":
+            updated_override = bool(command.get("enabled", True))
+
+
 def predict_fix(
     current_lat: float,
     current_lon: float,
@@ -557,6 +622,198 @@ def predict_fix(
     )
 
 
+def _wrap_angle_deg(angle_deg: float) -> float:
+    """Normalize an angle into the [0, 360) interval."""
+
+    return float(angle_deg % 360.0)
+
+
+def _angle_delta_deg(from_deg: float, to_deg: float) -> float:
+    """Return the signed shortest delta from one heading to another."""
+
+    return float(((to_deg - from_deg + 180.0) % 360.0) - 180.0)
+
+
+def matched_offset_m(corr_result: CorrelationResult) -> float:
+    """Return the best available matched offset in meters."""
+
+    return float(
+        corr_result.best_offset_subsample_m
+        if np.isfinite(corr_result.best_offset_subsample_m)
+        else corr_result.best_offset_m
+    )
+
+
+def maybe_update_heading_from_correlation(
+    *,
+    current_azimuth_deg: float,
+    corr_result: CorrelationResult,
+    max_offset_m: float,
+    selected_window_size: int,
+    measurement_step_m: float,
+    used_prediction_only: bool,
+) -> float:
+    """Use correlation azimuth as a soft heading cue when position is still gated out."""
+
+    del measurement_step_m
+
+    if not used_prediction_only:
+        return _wrap_angle_deg(current_azimuth_deg)
+    if not np.isfinite(corr_result.best_azimuth_deg):
+        return _wrap_angle_deg(current_azimuth_deg)
+
+    matched_offset = matched_offset_m(corr_result)
+    max_trusted_offset_m = max(150.0, min(max_offset_m * 0.2, 400.0))
+    if not np.isfinite(matched_offset) or abs(matched_offset) > max_trusted_offset_m:
+        return _wrap_angle_deg(current_azimuth_deg)
+    if corr_result.peak_correlation < 0.9:
+        return _wrap_angle_deg(current_azimuth_deg)
+
+    target_azimuth_deg = _wrap_angle_deg(corr_result.best_azimuth_deg)
+    if corr_result.is_ambiguous:
+        # During a turn transition we can keep the predicted track alive, but we
+        # should not rotate aggressively when correlation peaks are not separated.
+        if (
+            corr_result.pslr_db < 1.5
+            or corr_result.ambiguity_peak_count > 1
+            or corr_result.confidence < 0.1
+        ):
+            return _wrap_angle_deg(current_azimuth_deg)
+        max_turn_deg = 8.0 if selected_window_size >= 30 else 12.0
+        delta_deg = _angle_delta_deg(current_azimuth_deg, target_azimuth_deg)
+        delta_deg = float(np.clip(delta_deg, -max_turn_deg, max_turn_deg))
+        return _wrap_angle_deg(current_azimuth_deg + delta_deg)
+
+    return target_azimuth_deg
+
+
+def build_prediction_navigation_decision(
+    *,
+    mode: str,
+    current_lat: float,
+    current_lon: float,
+    current_speed: float,
+    current_azimuth: float,
+    window_duration: float,
+    corr_result: CorrelationResult,
+    selected_window_size: int,
+    measurement_span_m: float,
+    max_offset_m: float,
+    heading_override_deg: float | None = None,
+) -> NavigationDecision:
+    """Build a prediction-only decision while still allowing soft heading cues."""
+
+    hinted_azimuth = (
+        _wrap_angle_deg(float(heading_override_deg))
+        if heading_override_deg is not None and np.isfinite(heading_override_deg)
+        else maybe_update_heading_from_correlation(
+            current_azimuth_deg=current_azimuth,
+            corr_result=corr_result,
+            max_offset_m=max_offset_m,
+            selected_window_size=selected_window_size,
+            measurement_step_m=measurement_span_m / max(selected_window_size - 1, 1),
+            used_prediction_only=True,
+        )
+    )
+    return NavigationDecision(
+        fix=predict_fix(
+            current_lat=current_lat,
+            current_lon=current_lon,
+            speed_mps=current_speed,
+            azimuth_deg=hinted_azimuth,
+            dt=float(window_duration),
+            confidence=corr_result.confidence,
+        ),
+        mode=mode,
+        used_prediction_only=True,
+    )
+
+
+def update_reacquisition_tracker(
+    tracker: ReacquisitionTracker,
+    *,
+    corr_result: CorrelationResult,
+    observability: ObservabilityMetrics,
+    flat: bool,
+    max_offset_m: float,
+) -> tuple[ReacquisitionTracker, bool]:
+    """Hold terrain acceptance after ambiguity until consecutive clean windows agree."""
+
+    if corr_result.is_ambiguous:
+        return (
+            ReacquisitionTracker(
+                pending=True,
+                stable_windows=0,
+                last_azimuth_deg=None,
+                last_offset_m=None,
+            ),
+            False,
+        )
+
+    if not tracker.pending:
+        return tracker, False
+
+    offset_m = matched_offset_m(corr_result)
+    candidate_ok = (
+        observability.is_informative
+        and not flat
+        and corr_result.is_reliable
+        and np.isfinite(corr_result.best_azimuth_deg)
+        and np.isfinite(offset_m)
+        and abs(offset_m) <= min(max_offset_m * 0.75, 1500.0)
+        and corr_result.pslr_db >= 3.0
+        and corr_result.peak_correlation >= 0.85
+        and corr_result.confidence >= 0.05
+    )
+    if not candidate_ok:
+        return (
+            ReacquisitionTracker(
+                pending=True,
+                stable_windows=0,
+                last_azimuth_deg=None,
+                last_offset_m=None,
+            ),
+            True,
+        )
+
+    if tracker.stable_windows <= 0 or tracker.last_azimuth_deg is None or tracker.last_offset_m is None:
+        return (
+            ReacquisitionTracker(
+                pending=True,
+                stable_windows=1,
+                last_azimuth_deg=float(corr_result.best_azimuth_deg),
+                last_offset_m=offset_m,
+            ),
+            True,
+        )
+
+    azimuth_delta_deg = abs(_angle_delta_deg(tracker.last_azimuth_deg, corr_result.best_azimuth_deg))
+    offset_delta_m = abs(tracker.last_offset_m - offset_m)
+    if azimuth_delta_deg <= 12.0 and offset_delta_m <= 180.0:
+        stable_windows = tracker.stable_windows + 1
+        if stable_windows >= 2:
+            return ReacquisitionTracker(), False
+        return (
+            ReacquisitionTracker(
+                pending=True,
+                stable_windows=stable_windows,
+                last_azimuth_deg=float(corr_result.best_azimuth_deg),
+                last_offset_m=offset_m,
+            ),
+            True,
+        )
+
+    return (
+        ReacquisitionTracker(
+            pending=True,
+            stable_windows=1,
+            last_azimuth_deg=float(corr_result.best_azimuth_deg),
+            last_offset_m=offset_m,
+        ),
+        True,
+    )
+
+
 def build_path_offsets_enu(
     speed_mps: float,
     azimuth_deg: float,
@@ -574,6 +831,123 @@ def build_path_offsets_enu(
     )
     times = np.arange(sample_count, dtype=float) * float(sample_dt)
     return times[:, np.newaxis] * velocity_xy[np.newaxis, :]
+
+
+def advance_geodetic_point(
+    *,
+    lat: float,
+    lon: float,
+    azimuth_deg: float,
+    distance_m: float,
+    geod: pyproj.Geod,
+) -> tuple[float, float]:
+    """Advance a geodetic point along the given azimuth by a metric distance."""
+
+    target_lon, target_lat, _ = geod.fwd(lon, lat, azimuth_deg, max(float(distance_m), 0.0))
+    return float(target_lat), float(target_lon)
+
+
+def _offset_lat_lon(lat: float, lon: float, east_m: float, north_m: float, geod: pyproj.Geod) -> tuple[float, float]:
+    """Move a geodetic point by local EN offsets."""
+
+    intermediate_lon, intermediate_lat, _ = geod.fwd(lon, lat, 90.0, float(east_m))
+    target_lon, target_lat, _ = geod.fwd(intermediate_lon, intermediate_lat, 0.0, float(north_m))
+    return float(target_lat), float(target_lon)
+
+
+def local_reacquisition_search(
+    *,
+    extractor: ProfileExtractor,
+    correlator: Correlator,
+    h_meas: np.ndarray,
+    azimuth_axis: np.ndarray,
+    predicted_start_lat: float,
+    predicted_start_lon: float,
+    expected_azimuth_deg: float,
+    measurement_step_m: float,
+    noise_sigma_m: float,
+    flat_terrain_threshold_m: float,
+    geod: pyproj.Geod,
+) -> LocalReacquisitionResult | None:
+    """Search a small neighborhood around the predicted window start for reacquisition."""
+
+    local_offsets_m = (-180.0, 0.0, 180.0)
+    azimuth_half_window_deg = 25.0
+    local_azimuth_axis = np.asarray(
+        [
+            azimuth
+            for azimuth in np.asarray(azimuth_axis, dtype=float)
+            if abs(_angle_delta_deg(expected_azimuth_deg, float(azimuth))) <= azimuth_half_window_deg
+        ],
+        dtype=float,
+    )
+    if local_azimuth_axis.size == 0:
+        local_azimuth_axis = np.asarray([_wrap_angle_deg(expected_azimuth_deg)], dtype=float)
+    candidates: list[LocalReacquisitionResult] = []
+    for north_m in local_offsets_m:
+        for east_m in local_offsets_m:
+            candidate_lat, candidate_lon = _offset_lat_lon(
+                predicted_start_lat,
+                predicted_start_lon,
+                east_m,
+                north_m,
+                geod,
+            )
+            try:
+                ref_matrix = extractor.build_reference_matrix(
+                    candidate_lat,
+                    candidate_lon,
+                    azimuths=local_azimuth_axis,
+                )
+            except ValueError:
+                continue
+            corr_result = correlator.compute(
+                h_meas=h_meas,
+                ref_matrix=ref_matrix,
+                azimuths_deg=local_azimuth_axis,
+            )
+            observability = compute_observability_metrics(
+                corr_result.best_reference_profile,
+                sigma_noise_m=max(noise_sigma_m, 1e-3),
+                step_m=measurement_step_m,
+            )
+            flat = is_flat_terrain(h_meas, threshold_m=flat_terrain_threshold_m)
+            candidates.append(
+                LocalReacquisitionResult(
+                    start_lat=candidate_lat,
+                    start_lon=candidate_lon,
+                    corr_result=corr_result,
+                    observability=observability,
+                    flat=flat,
+                )
+            )
+
+    if not candidates:
+        return None
+
+    def _score(candidate: LocalReacquisitionResult) -> tuple[float, float, float, float]:
+        corr = candidate.corr_result
+        obs = candidate.observability
+        azimuth_delta_deg = abs(_angle_delta_deg(expected_azimuth_deg, corr.best_azimuth_deg))
+        azimuth_penalty = min(azimuth_delta_deg / 90.0, 1.0)
+        return (
+            1.0 if corr.is_reliable else 0.0,
+            1.0 if obs.is_informative else 0.0,
+            float(corr.peak_correlation + corr.confidence + max(corr.pslr_db, 0.0) * 0.05 - azimuth_penalty * 0.35),
+            -abs(matched_offset_m(corr)),
+        )
+
+    best_candidate = max(candidates, key=_score)
+    LOGGER.info(
+        "Local reacquisition selected center=(%.6f, %.6f) peak=%.3f pslr=%.2f offset=%.1f az_delta=%.1f",
+        best_candidate.start_lat,
+        best_candidate.start_lon,
+        best_candidate.corr_result.peak_correlation,
+        best_candidate.corr_result.pslr_db,
+        matched_offset_m(best_candidate.corr_result),
+        abs(_angle_delta_deg(expected_azimuth_deg, best_candidate.corr_result.best_azimuth_deg)),
+    )
+    return best_candidate
 
 
 def make_level_imu_sample(speed_mps: float, azimuth_deg: float, prev_azimuth_deg: float, dt: float) -> ImuSample:
@@ -611,6 +985,34 @@ def eskf_state_to_imm_result(eskf: ESKF) -> IMMResult:
     )
 
 
+def position_fix_to_imm_result(
+    position_fix: PositionEstimate,
+    *,
+    model_weights: np.ndarray | None = None,
+    dominant_mode: str = "terrain",
+) -> IMMResult:
+    """Wrap a raw terrain fix into the legacy IMM-shaped container used by metrics/UI."""
+
+    covariance = np.zeros((4, 4), dtype=float)
+    covariance[:2, :2] = np.asarray(position_fix.cov_matrix, dtype=float)
+    sigma_vel = max(position_fix.speed_mps * 0.15, 2.0)
+    covariance[2, 2] = sigma_vel**2
+    covariance[3, 3] = sigma_vel**2
+    return IMMResult(
+        lat=float(position_fix.lat),
+        lon=float(position_fix.lon),
+        speed_mps=float(position_fix.speed_mps),
+        azimuth_deg=float(position_fix.azimuth_deg),
+        model_weights=(
+            np.asarray(model_weights, dtype=float).copy()
+            if model_weights is not None
+            else np.array([0.0, 1.0, 0.0], dtype=float)
+        ),
+        covariance=covariance,
+        dominant_mode=str(dominant_mode),
+    )
+
+
 def choose_navigation_fix(
     *,
     config: Config,
@@ -621,80 +1023,94 @@ def choose_navigation_fix(
     current_speed: float,
     current_azimuth: float,
     window_duration: float,
+    measurement_span_m: float,
+    update_dt: float | None = None,
     window_counter: int,
     flat: bool,
     observability: ObservabilityMetrics,
+    selected_window_size: int = 50,
+    max_offset_m: float = 2000.0,
 ) -> NavigationDecision:
     """Select between accepted terrain fix and predictive fallback."""
 
-    if window_counter < config.cold_start_windows:
-        return NavigationDecision(
-            fix=predict_fix(
-                current_lat=window_start_lat,
-                current_lon=window_start_lon,
-                speed_mps=current_speed,
-                azimuth_deg=current_azimuth,
-                dt=window_duration,
-                confidence=corr_result.confidence,
-            ),
-            mode="cold_start_prediction",
-            used_prediction_only=True,
-        )
+    prediction_dt = float(window_duration)
+    hinted_azimuth = maybe_update_heading_from_correlation(
+        current_azimuth_deg=current_azimuth,
+        corr_result=corr_result,
+        max_offset_m=max_offset_m,
+        selected_window_size=selected_window_size,
+        measurement_step_m=measurement_span_m / max(selected_window_size - 1, 1),
+        used_prediction_only=True,
+    )
+    matched_offset = matched_offset_m(corr_result)
+    if (
+        window_counter == 0
+        and np.isfinite(corr_result.best_azimuth_deg)
+        and np.isfinite(matched_offset)
+        and abs(matched_offset) <= 30.0
+        and corr_result.peak_correlation >= 0.95
+    ):
+        hinted_azimuth = _wrap_angle_deg(corr_result.best_azimuth_deg)
 
     if flat:
-        return NavigationDecision(
-            fix=predict_fix(
-                current_lat=window_start_lat,
-                current_lon=window_start_lon,
-                speed_mps=current_speed,
-                azimuth_deg=current_azimuth,
-                dt=window_duration,
-                confidence=corr_result.confidence,
-            ),
+        return build_prediction_navigation_decision(
             mode="terrain_flat_fallback",
-            used_prediction_only=True,
+            current_lat=window_start_lat,
+            current_lon=window_start_lon,
+            current_speed=current_speed,
+            current_azimuth=current_azimuth,
+            window_duration=prediction_dt,
+            corr_result=corr_result,
+            selected_window_size=selected_window_size,
+            measurement_span_m=measurement_span_m,
+            max_offset_m=max_offset_m,
+            heading_override_deg=hinted_azimuth,
         )
 
     if not observability.is_informative:
-        return NavigationDecision(
-            fix=predict_fix(
-                current_lat=window_start_lat,
-                current_lon=window_start_lon,
-                speed_mps=current_speed,
-                azimuth_deg=current_azimuth,
-                dt=window_duration,
-                confidence=corr_result.confidence,
-            ),
+        return build_prediction_navigation_decision(
             mode="terrain_uninformative_fallback",
-            used_prediction_only=True,
+            current_lat=window_start_lat,
+            current_lon=window_start_lon,
+            current_speed=current_speed,
+            current_azimuth=current_azimuth,
+            window_duration=prediction_dt,
+            corr_result=corr_result,
+            selected_window_size=selected_window_size,
+            measurement_span_m=measurement_span_m,
+            max_offset_m=max_offset_m,
+            heading_override_deg=hinted_azimuth,
         )
 
     if corr_result.is_ambiguous:
-        return NavigationDecision(
-            fix=predict_fix(
-                current_lat=window_start_lat,
-                current_lon=window_start_lon,
-                speed_mps=current_speed,
-                azimuth_deg=current_azimuth,
-                dt=window_duration,
-                confidence=corr_result.confidence,
-            ),
+        return build_prediction_navigation_decision(
             mode="terrain_ambiguous_fallback",
-            used_prediction_only=True,
+            current_lat=window_start_lat,
+            current_lon=window_start_lon,
+            current_speed=current_speed,
+            current_azimuth=current_azimuth,
+            window_duration=prediction_dt,
+            corr_result=corr_result,
+            selected_window_size=selected_window_size,
+            measurement_span_m=measurement_span_m,
+            max_offset_m=max_offset_m,
+            heading_override_deg=hinted_azimuth,
         )
 
     if not corr_result.is_reliable:
-        return NavigationDecision(
-            fix=predict_fix(
-                current_lat=window_start_lat,
-                current_lon=window_start_lon,
-                speed_mps=current_speed,
-                azimuth_deg=current_azimuth,
-                dt=window_duration,
-                confidence=corr_result.confidence,
-            ),
-            mode="terrain_low_confidence_fallback",
-            used_prediction_only=True,
+        fallback_mode = "cold_start_prediction" if window_counter < config.cold_start_windows else "terrain_low_confidence_fallback"
+        return build_prediction_navigation_decision(
+            mode=fallback_mode,
+            current_lat=window_start_lat,
+            current_lon=window_start_lon,
+            current_speed=current_speed,
+            current_azimuth=current_azimuth,
+            window_duration=prediction_dt,
+            corr_result=corr_result,
+            selected_window_size=selected_window_size,
+            measurement_span_m=measurement_span_m,
+            max_offset_m=max_offset_m,
+            heading_override_deg=hinted_azimuth,
         )
 
     return NavigationDecision(
@@ -703,6 +1119,8 @@ def choose_navigation_fix(
             start_lat=window_start_lat,
             start_lon=window_start_lon,
             window_duration_s=window_duration,
+            update_dt_s=update_dt,
+            measurement_span_m=measurement_span_m,
         ),
         mode="terrain_update_accepted",
         used_prediction_only=False,
@@ -726,6 +1144,243 @@ def build_window_sizes(config: Config, available_frames: int) -> list[int]:
     return sorted({size for size in sizes if size <= available_frames})
 
 
+def build_turn_probe_window_sizes(config: Config, available_frames: int) -> list[int]:
+    """Return a tiny set of shorter fixed windows used only during turn-transition checks."""
+
+    if config.adaptive_window or available_frames < config.window_size or config.window_size < 30:
+        return []
+
+    probe_sizes = [
+        max(30, config.window_size - config.step_size),
+        max(20, config.window_size - 2 * config.step_size),
+        max(20, config.window_size - 3 * config.step_size),
+        20,
+    ]
+    return sorted({size for size in probe_sizes if 20 <= size < config.window_size and size <= available_frames})
+
+
+def maybe_select_turn_transition_window(
+    config: Config,
+    evaluations: list[WindowSelection],
+    current_azimuth_deg: float | None,
+) -> WindowSelection | None:
+    """Use a shorter tail window when a long window likely straddles a turn."""
+
+    if config.adaptive_window or len(evaluations) < 2 or current_azimuth_deg is None:
+        return None
+
+    base = next((item for item in evaluations if item.window_size == config.window_size), None)
+    if base is None:
+        return None
+
+    base_delta_deg = (
+        abs(_angle_delta_deg(current_azimuth_deg, base.corr_result.best_azimuth_deg))
+        if np.isfinite(base.corr_result.best_azimuth_deg)
+        else float("inf")
+    )
+    base_peak = float(base.corr_result.peak_correlation)
+    base_confidence = float(base.corr_result.confidence)
+    base_pslr_db = float(base.corr_result.pslr_db)
+
+    turn_candidates = [
+        item
+        for item in evaluations
+        if item.window_size < base.window_size
+        and item.observability.is_informative
+        and item.corr_result.is_reliable
+        and not item.corr_result.is_ambiguous
+        and not item.flat
+    ]
+    if not turn_candidates:
+        return None
+
+    transition_like_base = (
+        not base.flat
+        and base.observability.is_informative
+        and (
+            (
+                base.corr_result.is_reliable
+                and 5.0 <= base_delta_deg <= 45.0
+                and (
+                    base.corr_result.is_ambiguous
+                    or base_pslr_db < 4.0
+                    or base_confidence < 0.03
+                )
+            )
+            or (
+                not base.corr_result.is_ambiguous
+                and base.corr_result.is_reliable
+                and 5.0 <= base_delta_deg <= 35.0
+            )
+        )
+    )
+    if not transition_like_base:
+        return None
+
+    prioritized_candidates = [
+        item
+        for item in turn_candidates
+        if item.corr_result.peak_correlation >= max(base_peak - 0.05, 0.0)
+        and item.corr_result.confidence >= max(base_confidence * 0.75, 0.02)
+        and (
+            abs(_angle_delta_deg(base.corr_result.best_azimuth_deg, item.corr_result.best_azimuth_deg)) >= 10.0
+            or item.corr_result.pslr_db >= base_pslr_db + 0.75
+            or item.corr_result.confidence >= max(base_confidence * 1.5, 0.05)
+        )
+    ]
+    if not prioritized_candidates:
+        return None
+
+    if base.corr_result.is_ambiguous or base_pslr_db < 2.0:
+        strongest = max(
+            prioritized_candidates,
+            key=lambda item: (
+                item.corr_result.pslr_db,
+                item.corr_result.peak_correlation,
+                item.corr_result.confidence,
+            ),
+        )
+        nearly_equivalent = [
+            item
+            for item in prioritized_candidates
+            if item.corr_result.pslr_db >= strongest.corr_result.pslr_db - 0.75
+            and item.corr_result.peak_correlation >= strongest.corr_result.peak_correlation - 0.03
+            and item.corr_result.confidence >= max(strongest.corr_result.confidence * 0.75, 0.02)
+        ]
+        selected = min(nearly_equivalent, key=lambda item: float(item.window_size))
+    else:
+        selected = max(
+            prioritized_candidates,
+            key=lambda item: (
+                item.corr_result.pslr_db,
+                item.corr_result.peak_correlation,
+                item.corr_result.confidence,
+                -float(item.window_size),
+            ),
+        )
+    LOGGER.info(
+        "Turn-transition override selected: base=%s az=%.1f pslr=%.2f current=%.1f -> short=%s az=%.1f pslr=%.2f",
+        base.window_size,
+        base.corr_result.best_azimuth_deg,
+        base_pslr_db,
+        current_azimuth_deg,
+        selected.window_size,
+        selected.corr_result.best_azimuth_deg,
+        selected.corr_result.pslr_db,
+    )
+    return selected
+
+
+def maybe_trim_turn_transition_tail(
+    *,
+    config: Config,
+    selection: WindowSelection,
+    correlator: Correlator,
+    ref_matrix: np.ndarray,
+    azimuths_deg: np.ndarray,
+    baro_track: BaroTrack,
+    terrain_bias_m: float,
+    measurement_step_m: float,
+    current_azimuth_deg: float | None,
+) -> WindowSelection | None:
+    """Re-evaluate a suspicious turn-transition window on a short trailing tail."""
+
+    if current_azimuth_deg is None or selection.window_size <= 20 or selection.flat:
+        return None
+
+    heading_delta_deg = (
+        abs(_angle_delta_deg(current_azimuth_deg, selection.corr_result.best_azimuth_deg))
+        if np.isfinite(selection.corr_result.best_azimuth_deg)
+        else float("inf")
+    )
+    suspicious_long_window = (
+        5.0 <= heading_delta_deg <= 90.0
+        and (
+            selection.corr_result.is_ambiguous
+            or selection.corr_result.pslr_db < 2.5
+            or selection.corr_result.confidence < 0.03
+        )
+    )
+    if not suspicious_long_window:
+        return None
+
+    tail_sizes = sorted(
+        {
+            size
+            for size in (20, 30)
+            if 20 <= size < selection.window_size and size <= len(selection.frame_packets)
+        }
+    )
+    if not tail_sizes:
+        return None
+
+    tail_candidates: list[WindowSelection] = []
+    for tail_size in tail_sizes:
+        tail_packets = selection.frame_packets[-tail_size:]
+        terrain_profile = frames_to_terrain_profile(
+            [item.frame for item in tail_packets],
+            baro_track,
+            terrain_bias_m=terrain_bias_m,
+        )
+        h_meas = terrain_profile.values_m
+        flat = is_flat_terrain(h_meas, threshold_m=config.flat_terrain_threshold_m)
+        corr_result = correlator.compute(
+            h_meas=h_meas,
+            ref_matrix=ref_matrix,
+            azimuths_deg=azimuths_deg,
+        )
+        observability = compute_observability_metrics(
+            corr_result.best_reference_profile,
+            sigma_noise_m=max(config.noise_sigma, 1e-3),
+            step_m=measurement_step_m,
+        )
+        tail_candidates.append(
+            WindowSelection(
+                frame_packets=tail_packets,
+                window_size=tail_size,
+                corr_result=corr_result,
+                observability=observability,
+                flat=flat,
+            )
+        )
+
+    accepted_candidates = [
+        item
+        for item in tail_candidates
+        if item.observability.is_informative
+        and item.corr_result.is_reliable
+        and not item.corr_result.is_ambiguous
+        and not item.flat
+        and item.corr_result.peak_correlation >= max(selection.corr_result.peak_correlation - 0.08, 0.0)
+        and item.corr_result.confidence >= max(selection.corr_result.confidence * 0.8, 0.02)
+        and (
+            item.corr_result.pslr_db >= selection.corr_result.pslr_db + 0.75
+            or abs(_angle_delta_deg(selection.corr_result.best_azimuth_deg, item.corr_result.best_azimuth_deg)) >= 10.0
+        )
+    ]
+    if not accepted_candidates:
+        return None
+
+    selected = min(
+        accepted_candidates,
+        key=lambda item: (
+            -item.corr_result.pslr_db,
+            -item.corr_result.peak_correlation,
+            float(item.window_size),
+        ),
+    )
+    LOGGER.info(
+        "Turn-tail trim selected: base=%s az=%.1f pslr=%.2f -> tail=%s az=%.1f pslr=%.2f",
+        selection.window_size,
+        selection.corr_result.best_azimuth_deg,
+        selection.corr_result.pslr_db,
+        selected.window_size,
+        selected.corr_result.best_azimuth_deg,
+        selected.corr_result.pslr_db,
+    )
+    return selected
+
+
 def select_processing_window(
     *,
     config: Config,
@@ -735,11 +1390,14 @@ def select_processing_window(
     azimuths_deg: np.ndarray,
     measurement_step_m: float,
     terrain_bias_m: float,
+    current_azimuth_deg: float | None = None,
 ) -> WindowSelection | None:
     """Select a fixed or adaptive processing window based on observability and ambiguity."""
 
-    candidate_sizes = build_window_sizes(config, len(buffer))
-    if not candidate_sizes:
+    primary_candidate_sizes = build_window_sizes(config, len(buffer))
+    probe_candidate_sizes = build_turn_probe_window_sizes(config, len(buffer))
+    candidate_sizes = sorted(set(primary_candidate_sizes + probe_candidate_sizes))
+    if not primary_candidate_sizes:
         return None
 
     evaluations: list[WindowSelection] = []
@@ -775,12 +1433,22 @@ def select_processing_window(
 
         if (
             config.adaptive_window
-            and observability.is_informative
-            and corr_result.is_reliable
-            and not corr_result.is_ambiguous
-            and not flat
+            and evaluations[-1].observability.is_informative
+            and evaluations[-1].corr_result.is_reliable
+            and not evaluations[-1].corr_result.is_ambiguous
+            and not evaluations[-1].flat
         ):
             return evaluations[-1]
+
+    turn_transition_selection = maybe_select_turn_transition_window(
+        config,
+        evaluations,
+        current_azimuth_deg,
+    )
+    if turn_transition_selection is not None:
+        return turn_transition_selection
+
+    scored_evaluations = [item for item in evaluations if item.window_size in set(primary_candidate_sizes)]
 
     def _score(item: WindowSelection) -> tuple[float, float, float]:
         informative_bonus = 1.0 if item.observability.is_informative else 0.0
@@ -792,7 +1460,7 @@ def select_processing_window(
         tertiary = -float(item.window_size)
         return (primary, secondary, tertiary)
 
-    return max(evaluations, key=_score)
+    return max(scored_evaluations, key=_score)
 
 
 def pipeline_worker(
@@ -818,9 +1486,16 @@ def pipeline_worker(
     current_speed = config.speed_mps
     step_dt = config.step_size / config.freq_hz
     window_counter = 0
+    reacquisition_tracker = ReacquisitionTracker()
     terrain_bias_m = 0.0
+    runtime_stats: dict[str, Any] = {
+        "frame_drop_count": 0,
+        "state_queue_replacements": 0,
+        "state_payloads_enqueued": 0,
+    }
     measurement_step_m = config.speed_mps / config.freq_hz
-    measured_profile_length_m = config.max_window_size * measurement_step_m if config.adaptive_window else config.window_size * measurement_step_m
+    max_profile_intervals = max((config.max_window_size if config.adaptive_window else config.window_size) - 1, 0)
+    measured_profile_length_m = max_profile_intervals * measurement_step_m
     reference_profile_length_m = measured_profile_length_m + config.max_offset_m
 
     with DEMLoader(config.dem_path) as dem:
@@ -923,10 +1598,18 @@ def pipeline_worker(
                     best_reference_profile=h_meas.copy(),
                 )
                 try:
-                    dem_patch, _ = dem.get_patch(eskf_result.lat, eskf_result.lon, radius_m=config.dem_patch_radius_m)
+                    dem_patch, dem_patch_transform = dem.get_patch(
+                        eskf_result.lat,
+                        eskf_result.lon,
+                        radius_m=config.dem_patch_radius_m,
+                    )
                 except ValueError:
                     fallback_lat, fallback_lon = dem.get_center()
-                    dem_patch, _ = dem.get_patch(fallback_lat, fallback_lon, radius_m=config.dem_patch_radius_m)
+                    dem_patch, dem_patch_transform = dem.get_patch(
+                        fallback_lat,
+                        fallback_lon,
+                        radius_m=config.dem_patch_radius_m,
+                    )
                 history.append((center_frame_index, eskf_result))
                 _enqueue_state(
                     state_queue,
@@ -936,6 +1619,7 @@ def pipeline_worker(
                         "h_meas": h_meas,
                         "ref": corr_result.best_reference_profile,
                         "dem_patch": dem_patch,
+                        "dem_patch_transform": tuple(float(value) for value in dem_patch_transform[:6]),
                         "hdop": float(math.sqrt(max(np.trace(terrain_update.cov_2x2), 0.0))),
                         "nav_mode": "eskf_terrain_pf",
                         "used_prediction_only": not terrain_update.converged,
@@ -986,53 +1670,145 @@ def pipeline_worker(
                     azimuths_deg=azimuth_axis,
                     measurement_step_m=measurement_step_m,
                     terrain_bias_m=terrain_bias_m,
+                    current_azimuth_deg=current_azimuth,
                 )
                 if selection is None:
                     continue
+
+                if not reacquisition_tracker.pending:
+                    turn_tail_selection = maybe_trim_turn_transition_tail(
+                        config=config,
+                        selection=selection,
+                        correlator=correlator,
+                        ref_matrix=ref_matrix,
+                        azimuths_deg=azimuth_axis,
+                        baro_track=baro_track,
+                        terrain_bias_m=terrain_bias_m,
+                        measurement_step_m=measurement_step_m,
+                        current_azimuth_deg=current_azimuth,
+                    )
+                    if turn_tail_selection is not None:
+                        selection = turn_tail_selection
 
                 selected_window_size = selection.window_size
                 frames_window = [item.frame for item in selection.frame_packets]
                 center_frame_index = selection.frame_packets[-1].index
                 latest_packet = selection.frame_packets[-1]
+                solve_start_lat = window_start_lat
+                solve_start_lon = window_start_lon
+                active_frame_packets = selection.frame_packets
+                active_window_size = selection.window_size
+                if reacquisition_tracker.pending:
+                    active_window_size = min(20, selection.window_size)
+                    active_frame_packets = selection.frame_packets[-active_window_size:]
+                    skipped_intervals = max(selection.window_size - active_window_size, 0)
+                    solve_start_lat, solve_start_lon = advance_geodetic_point(
+                        lat=window_start_lat,
+                        lon=window_start_lon,
+                        azimuth_deg=current_azimuth,
+                        distance_m=skipped_intervals * measurement_step_m,
+                        geod=geod,
+                    )
+
+                frames_window = [item.frame for item in active_frame_packets]
                 terrain_profile = frames_to_terrain_profile(
                     frames_window,
                     baro_track,
                     terrain_bias_m=terrain_bias_m,
                 )
                 h_meas = terrain_profile.values_m
-                flat = selection.flat
-                corr_result = selection.corr_result
-                observability = selection.observability
-                window_duration = selection.window_size / config.freq_hz
+                flat = is_flat_terrain(h_meas, threshold_m=config.flat_terrain_threshold_m)
+                window_duration = max(active_window_size - 1, 0) / config.freq_hz
+                measurement_span_m = max(active_window_size - 1, 0) * measurement_step_m
 
-                nav_decision = choose_navigation_fix(
-                    config=config,
+                if reacquisition_tracker.pending:
+                    local_reacquisition = local_reacquisition_search(
+                        extractor=extractor,
+                        correlator=correlator,
+                        h_meas=h_meas,
+                        azimuth_axis=azimuth_axis,
+                        predicted_start_lat=window_start_lat,
+                        predicted_start_lon=window_start_lon,
+                        expected_azimuth_deg=current_azimuth,
+                        measurement_step_m=measurement_step_m,
+                        noise_sigma_m=config.noise_sigma,
+                        flat_terrain_threshold_m=config.flat_terrain_threshold_m,
+                        geod=geod,
+                    )
+                    if local_reacquisition is not None:
+                        corr_result = local_reacquisition.corr_result
+                        observability = local_reacquisition.observability
+                        flat = local_reacquisition.flat
+                        solve_start_lat = local_reacquisition.start_lat
+                        solve_start_lon = local_reacquisition.start_lon
+                    else:
+                        corr_result = selection.corr_result
+                        observability = selection.observability
+                else:
+                    corr_result = selection.corr_result
+                    observability = selection.observability
+
+                reacquisition_tracker, hold_reacquisition = update_reacquisition_tracker(
+                    reacquisition_tracker,
                     corr_result=corr_result,
-                    solver=solver,
-                    window_start_lat=window_start_lat,
-                    window_start_lon=window_start_lon,
-                    current_speed=current_speed,
-                    current_azimuth=current_azimuth,
-                    window_duration=window_duration,
-                    window_counter=window_counter,
-                    flat=flat,
                     observability=observability,
+                    flat=flat,
+                    max_offset_m=config.max_offset_m,
                 )
-                position_fix = nav_decision.fix
-                degraded = nav_decision.used_prediction_only or (not corr_result.informative)
-                if (
-                    not nav_decision.used_prediction_only
-                    and corr_result.is_reliable
-                    and corr_result.best_reference_profile.size == h_meas.size
-                ):
-                    residual_m = float(
-                        np.nanmedian(h_meas - corr_result.best_reference_profile)
+
+                if hold_reacquisition:
+                    nav_decision = build_prediction_navigation_decision(
+                        mode="terrain_reacquire_wait",
+                        current_lat=window_start_lat,
+                        current_lon=window_start_lon,
+                        current_speed=current_speed,
+                        current_azimuth=current_azimuth,
+                        window_duration=window_duration,
+                        corr_result=corr_result,
+                        selected_window_size=active_window_size,
+                        measurement_span_m=measurement_span_m,
+                        max_offset_m=config.max_offset_m,
                     )
-                    terrain_bias_m = update_terrain_bias(
-                        terrain_bias_m,
-                        residual_m,
-                        gain=0.1,
+                    position_fix = nav_decision.fix
+                    degraded = True
+                else:
+                    nav_decision = choose_navigation_fix(
+                        config=config,
+                        corr_result=corr_result,
+                        solver=solver,
+                        window_start_lat=solve_start_lat,
+                        window_start_lon=solve_start_lon,
+                        current_speed=current_speed,
+                        current_azimuth=current_azimuth,
+                        window_duration=window_duration,
+                        measurement_span_m=measurement_span_m,
+                        update_dt=step_dt,
+                        window_counter=window_counter,
+                        flat=flat,
+                        observability=observability,
+                        selected_window_size=active_window_size,
+                        max_offset_m=config.max_offset_m,
                     )
+                    position_fix = nav_decision.fix
+                    degraded = nav_decision.used_prediction_only or (not corr_result.informative)
+                    if (
+                        not nav_decision.used_prediction_only
+                        and corr_result.is_reliable
+                        and corr_result.best_reference_profile.size == h_meas.size
+                    ):
+                        residual_m = float(
+                            np.nanmedian(h_meas - corr_result.best_reference_profile)
+                        )
+                        terrain_bias_m = update_terrain_bias(
+                            terrain_bias_m,
+                            residual_m,
+                            gain=0.1,
+                        )
+                    if nav_decision.mode == "terrain_ambiguous_fallback":
+                        reacquisition_tracker = ReacquisitionTracker(pending=True)
+                    elif not nav_decision.used_prediction_only:
+                        reacquisition_tracker = ReacquisitionTracker()
+
             except Exception:
                 LOGGER.exception("Window processing failed, switching to degraded coasting mode")
                 selection_window_size = min(len(buffer), config.window_size)
@@ -1065,14 +1841,15 @@ def pipeline_worker(
                     efficiency_hint=0.0,
                     is_informative=False,
                 )
-                window_duration = selection_window_size / config.freq_hz
+                window_duration = max(selection_window_size - 1, 0) / config.freq_hz
+                measurement_span_m = max(selection_window_size - 1, 0) * measurement_step_m
                 nav_decision = NavigationDecision(
                     fix=predict_fix(
                         current_lat=window_start_lat,
                         current_lon=window_start_lon,
                         speed_mps=current_speed,
                         azimuth_deg=current_azimuth,
-                        dt=window_duration,
+                        dt=window_duration if window_counter == 0 else step_dt,
                         confidence=0.0,
                     ),
                     mode="terrain_exception_fallback",
@@ -1082,19 +1859,51 @@ def pipeline_worker(
                 degraded = True
 
             imm_result = imm.update(position_fix, dt=step_dt, is_flat=flat)
-            current_azimuth = imm_result.azimuth_deg
-            current_speed = imm_result.speed_mps
-            dem_patch, _ = dem.get_patch(imm_result.lat, imm_result.lon, radius_m=config.dem_patch_radius_m)
+            if not nav_decision.used_prediction_only:
+                current_azimuth = position_fix.azimuth_deg
+                current_speed = position_fix.speed_mps
+            else:
+                current_azimuth = maybe_update_heading_from_correlation(
+                    current_azimuth_deg=current_azimuth,
+                    corr_result=corr_result,
+                    max_offset_m=config.max_offset_m,
+                    selected_window_size=selected_window_size,
+                    measurement_step_m=measurement_step_m,
+                    used_prediction_only=nav_decision.used_prediction_only,
+                )
+            output_result = position_fix_to_imm_result(
+                position_fix,
+                model_weights=imm_result.model_weights,
+                dominant_mode=imm_result.dominant_mode,
+            )
+            dem_patch, dem_patch_transform = dem.get_patch(
+                output_result.lat,
+                output_result.lon,
+                radius_m=config.dem_patch_radius_m,
+            )
 
-            history.append((center_frame_index, imm_result))
+            history.append((center_frame_index, output_result))
+            pipeline_emitted_monotonic_s = time.perf_counter()
+            pipeline_latency_ms = max(
+                (pipeline_emitted_monotonic_s - float(latest_packet.ingest_monotonic_s)) * 1000.0,
+                0.0,
+            )
+            runtime_stats["state_payloads_enqueued"] = int(runtime_stats.get("state_payloads_enqueued", 0)) + 1
+            integrity_status = (
+                "OK"
+                if int(runtime_stats.get("frame_drop_count", 0)) == 0
+                and int(runtime_stats.get("state_queue_replacements", 0)) == 0
+                else "DEGRADED"
+            )
             _enqueue_state(
                 state_queue,
                 {
                     "corr": corr_result,
-                    "fix": imm_result,
+                    "fix": output_result,
                     "h_meas": h_meas,
                     "ref": corr_result.best_reference_profile,
                     "dem_patch": dem_patch,
+                    "dem_patch_transform": tuple(float(value) for value in dem_patch_transform[:6]),
                     "hdop": imm.get_hdop(),
                     "nav_mode": nav_decision.mode,
                     "used_prediction_only": nav_decision.used_prediction_only,
@@ -1118,6 +1927,11 @@ def pipeline_worker(
                         "is_informative": observability.is_informative,
                     },
                     "terrain_bias_m": terrain_bias_m,
+                    "event_ingest_monotonic_s": float(latest_packet.ingest_monotonic_s),
+                    "pipeline_emitted_monotonic_s": float(pipeline_emitted_monotonic_s),
+                    "pipeline_latency_ms": float(pipeline_latency_ms),
+                    "integrity_status": integrity_status,
+                    "runtime_stats": runtime_stats.copy(),
                 },
                 stop_event,
             )
@@ -1125,14 +1939,31 @@ def pipeline_worker(
             for _ in range(min(config.step_size, len(buffer))):
                 if buffer:
                     buffer.popleft()
-            next_start_lon, next_start_lat, _ = geod.fwd(
-                window_start_lon,
-                window_start_lat,
-                current_azimuth,
-                current_speed * step_dt,
-            )
-            window_start_lat = float(next_start_lat)
-            window_start_lon = float(next_start_lon)
+            if not nav_decision.used_prediction_only:
+                matched_offset_value = matched_offset_m(corr_result)
+                matched_origin_lon, matched_origin_lat, _ = geod.fwd(
+                    solve_start_lon,
+                    solve_start_lat,
+                    position_fix.azimuth_deg,
+                    matched_offset_value,
+                )
+                next_start_lon, next_start_lat, _ = geod.fwd(
+                    matched_origin_lon,
+                    matched_origin_lat,
+                    position_fix.azimuth_deg,
+                    config.step_size * measurement_step_m,
+                )
+                window_start_lat = float(next_start_lat)
+                window_start_lon = float(next_start_lon)
+            else:
+                next_start_lon, next_start_lat, _ = geod.fwd(
+                    window_start_lon,
+                    window_start_lat,
+                    current_azimuth,
+                    current_speed * step_dt,
+                )
+                window_start_lat = float(next_start_lat)
+                window_start_lon = float(next_start_lon)
             window_counter += 1
 
     return history
@@ -1146,6 +1977,18 @@ def _enqueue_state(state_queue: queue.Queue, payload: dict[str, Any], stop_event
             state_queue.put(payload, timeout=0.1)
             return
         except queue.Full:
+            stats = payload.get("runtime_stats")
+            if isinstance(stats, dict):
+                stats["state_queue_replacements"] = int(stats.get("state_queue_replacements", 0)) + 1
+                payload["integrity_status"] = (
+                    "STATE_QUEUE_REPLACED"
+                    if stats["state_queue_replacements"] > 0
+                    else "OK"
+                )
+                LOGGER.warning(
+                    "Dashboard state queue full; replacing oldest state (replacements=%s)",
+                    stats["state_queue_replacements"],
+                )
             try:
                 state_queue.get_nowait()
             except queue.Empty:
@@ -1174,13 +2017,13 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
     def producer_target() -> None:
         try:
             if config.mode == "sim":
-                simulation_producer(config, frame_queue, stop_event)
+                simulation_producer(config, frame_queue, stop_event, control_queue=control_queue)
             elif config.mode == "replay":
-                replay_producer(config, frame_queue, stop_event)
+                replay_producer(config, frame_queue, stop_event, control_queue=control_queue)
             elif config.mode == "sitl":
                 sitl_producer(config, frame_queue, stop_event, control_queue=control_queue)
             else:
-                live_producer(config, frame_queue, stop_event)
+                live_producer(config, frame_queue, stop_event, control_queue=control_queue)
         finally:
             producer_done_event.set()
 
@@ -1225,6 +2068,19 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
 
         producer_thread.join()
         pipeline_thread.join()
+        if (
+            dashboard_thread is not None
+            and config.enable_visualizer
+            and config.mode in {"sim", "replay"}
+            and not stop_event.is_set()
+        ):
+            LOGGER.info(
+                "Pipeline finished; keeping dashboard available at http://%s:%d until Ctrl+C",
+                config.dashboard_host,
+                config.dashboard_port,
+            )
+            while not stop_event.is_set():
+                time.sleep(0.25)
     finally:
         stop_event.set()
         signal.signal(signal.SIGINT, previous_handler)
