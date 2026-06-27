@@ -10,6 +10,7 @@ from imm_filter import IMMResult
 from main import (
     Config,
     GroundTruthPoint,
+    NavigationDecision,
     ReacquisitionTracker,
     WindowSelection,
     build_turn_probe_window_sizes,
@@ -20,9 +21,11 @@ from main import (
     maybe_trim_turn_transition_tail,
     maybe_update_heading_from_correlation,
     parse_args,
+    predict_fix,
     update_reacquisition_tracker,
+    update_motion_state_after_decision,
 )
-from position_solver import PositionEstimate
+from position_solver import PositionEstimate, PositionSolver
 from correlator import CorrelationResult, ObservabilityMetrics
 from measurement_layer import BaroTrack
 
@@ -329,13 +332,15 @@ def _corr(
     pslr_db: float = 7.0,
     azimuth_deg: float = 45.0,
     peak_correlation: float = 0.9,
+    offset_m: float = 300.0,
 ) -> CorrelationResult:
+    offset_steps = int(round(offset_m / 30.0))
     return CorrelationResult(
         best_azimuth_deg=azimuth_deg,
-        best_offset_steps=10,
-        best_offset_m=300.0,
-        best_offset_subsample_steps=10.2,
-        best_offset_subsample_m=306.0,
+        best_offset_steps=offset_steps,
+        best_offset_m=offset_m,
+        best_offset_subsample_steps=float(offset_steps),
+        best_offset_subsample_m=offset_m,
         peak_correlation=peak_correlation,
         confidence=confidence,
         is_reliable=is_reliable,
@@ -393,6 +398,37 @@ def test_choose_navigation_fix_uses_solver_when_terrain_update_is_accepted() -> 
     assert decision.mode == "terrain_update_accepted"
     assert decision.used_prediction_only is False
     assert decision.fix == solver.fix
+
+
+def test_choose_navigation_fix_rejects_physically_implausible_jump() -> None:
+    solver = PositionSolver()
+    solver.solve(
+        result=_corr(offset_m=0.0, azimuth_deg=45.0),
+        start_lat=60.5,
+        start_lon=90.3,
+        window_duration_s=10.0,
+        update_dt_s=2.0,
+        measurement_span_m=0.0,
+    )
+
+    decision = choose_navigation_fix(
+        config=_config(),
+        corr_result=_corr(offset_m=2000.0, azimuth_deg=45.0),
+        solver=solver,
+        window_start_lat=60.5,
+        window_start_lon=90.3,
+        current_speed=50.0,
+        current_azimuth=45.0,
+        window_duration=10.0,
+        measurement_span_m=0.0,
+        update_dt=2.0,
+        window_counter=5,
+        flat=False,
+        observability=ObservabilityMetrics(crlb_m=50.0, gradient_energy=2.0, efficiency_hint=0.4, is_informative=True),
+    )
+
+    assert decision.used_prediction_only is True
+    assert decision.mode.startswith("terrain_physical_gate_fallback")
 
 
 def test_choose_navigation_fix_falls_back_when_terrain_is_ambiguous() -> None:
@@ -497,6 +533,43 @@ def test_ambiguous_turn_transition_keeps_prediction_heading_when_pslr_is_low() -
     )
 
     assert hinted == 45.0
+
+
+def test_prediction_heading_cue_updates_next_motion_state() -> None:
+    corr = _corr(
+        is_reliable=False,
+        is_ambiguous=False,
+        confidence=0.1,
+        pslr_db=4.0,
+        azimuth_deg=1.5,
+        peak_correlation=0.98,
+        offset_m=0.0,
+    )
+    decision = NavigationDecision(
+        fix=predict_fix(
+            current_lat=60.5,
+            current_lon=90.3,
+            speed_mps=50.0,
+            azimuth_deg=1.5,
+            dt=10.0,
+            confidence=0.1,
+        ),
+        mode="cold_start_prediction",
+        used_prediction_only=True,
+    )
+
+    speed, azimuth = update_motion_state_after_decision(
+        nav_decision=decision,
+        corr_result=corr,
+        current_speed=50.0,
+        current_azimuth=45.0,
+        max_offset_m=2000.0,
+        selected_window_size=50,
+        measurement_step_m=10.0,
+    )
+
+    assert speed == 50.0
+    assert azimuth == 1.5
 
 
 def test_reacquisition_waits_for_two_stable_clean_windows_after_ambiguity() -> None:

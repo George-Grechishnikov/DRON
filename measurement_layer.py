@@ -127,6 +127,7 @@ def frames_to_terrain_profile(
         baro_bias_m=baro_bias_m,
         terrain_bias_m=terrain_bias_m,
     )
+    values_m = np.where(valid_mask, values_m, np.nan)
     return TerrainProfile(
         values_m=values_m.astype(float, copy=False),
         timestamps_s=timestamps.astype(float, copy=False),

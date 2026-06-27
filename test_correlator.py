@@ -119,6 +119,20 @@ def test_compute_returns_ambiguity_metrics() -> None:
     assert isinstance(result.is_ambiguous, bool)
 
 
+def test_compute_ambiguity_uses_two_dimensional_peak_geometry() -> None:
+    heatmap = np.zeros((360, 32), dtype=float)
+    heatmap[20, 8] = 1.0
+    heatmap[140, 24] = 0.92
+    heatmap[21, 8] = 0.4
+    heatmap[20, 9] = 0.4
+
+    ambiguity = Correlator.compute_ambiguity(heatmap, step_m=10.0)
+
+    assert ambiguity.n_peaks == 2
+    assert ambiguity.is_ambiguous is True
+    assert ambiguity.peak_isolation_m > 0.0
+
+
 def test_peak_quality_marks_single_sharp_peak_as_reliable() -> None:
     heatmap = np.zeros((360, 24), dtype=float)
     heatmap[120, 10] = 1.0

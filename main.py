@@ -729,6 +729,72 @@ def build_prediction_navigation_decision(
     )
 
 
+def update_motion_state_after_decision(
+    *,
+    nav_decision: NavigationDecision,
+    corr_result: CorrelationResult,
+    current_speed: float,
+    current_azimuth: float,
+    max_offset_m: float,
+    selected_window_size: int,
+    measurement_step_m: float,
+) -> tuple[float, float]:
+    """Return the motion state to use for the next prediction window."""
+
+    if not nav_decision.used_prediction_only:
+        return (
+            float(nav_decision.fix.speed_mps),
+            _wrap_angle_deg(nav_decision.fix.azimuth_deg),
+        )
+
+    if np.isfinite(nav_decision.fix.azimuth_deg):
+        return (float(current_speed), _wrap_angle_deg(nav_decision.fix.azimuth_deg))
+
+    hinted_azimuth = maybe_update_heading_from_correlation(
+        current_azimuth_deg=current_azimuth,
+        corr_result=corr_result,
+        max_offset_m=max_offset_m,
+        selected_window_size=selected_window_size,
+        measurement_step_m=measurement_step_m,
+        used_prediction_only=True,
+    )
+    return (float(current_speed), _wrap_angle_deg(hinted_azimuth))
+
+
+def terrain_fix_plausibility_reason(
+    *,
+    candidate_fix: PositionEstimate,
+    previous_fix: PositionEstimate | None,
+    current_speed: float,
+    current_azimuth: float,
+    update_dt: float | None,
+) -> str | None:
+    """Return a rejection reason when a terrain fix is physically implausible."""
+
+    if previous_fix is None:
+        return None
+
+    dt = (
+        float(update_dt)
+        if update_dt is not None and update_dt > 0.0
+        else max(candidate_fix.timestamp_s - previous_fix.timestamp_s, 1e-6)
+    )
+    speed_limit_mps = max(float(current_speed) * 2.5, float(current_speed) + 35.0, 80.0)
+    if candidate_fix.speed_mps > speed_limit_mps:
+        return f"speed_jump:{candidate_fix.speed_mps:.1f}>{speed_limit_mps:.1f}"
+
+    acceleration_mps2 = abs(candidate_fix.speed_mps - float(current_speed)) / max(dt, 1e-6)
+    if acceleration_mps2 > 25.0:
+        return f"accel_jump:{acceleration_mps2:.1f}>25.0"
+
+    turn_delta_deg = abs(_angle_delta_deg(current_azimuth, candidate_fix.azimuth_deg))
+    max_turn_delta_deg = min(120.0, max(45.0, 20.0 + 35.0 * dt))
+    if turn_delta_deg > max_turn_delta_deg:
+        return f"turn_jump:{turn_delta_deg:.1f}>{max_turn_delta_deg:.1f}"
+
+    return None
+
+
 def update_reacquisition_tracker(
     tracker: ReacquisitionTracker,
     *,
@@ -1112,6 +1178,41 @@ def choose_navigation_fix(
             max_offset_m=max_offset_m,
             heading_override_deg=hinted_azimuth,
         )
+
+    if hasattr(solver, "get_track") and hasattr(solver, "solve_with_velocity"):
+        solver_track = solver.get_track()
+        previous_fix = solver_track[-1] if solver_track else None
+        candidate_fix = solver.solve_with_velocity(
+            result=corr_result,
+            start_lat=window_start_lat,
+            start_lon=window_start_lon,
+            window_duration_s=window_duration,
+            update_dt_s=update_dt,
+            measurement_span_m=measurement_span_m,
+            prev_fix=previous_fix,
+        )
+        plausibility_reason = terrain_fix_plausibility_reason(
+            candidate_fix=candidate_fix,
+            previous_fix=previous_fix,
+            current_speed=current_speed,
+            current_azimuth=current_azimuth,
+            update_dt=update_dt,
+        )
+        if plausibility_reason is not None:
+            LOGGER.warning("Terrain fix rejected by physical gate: %s", plausibility_reason)
+            return build_prediction_navigation_decision(
+                mode=f"terrain_physical_gate_fallback:{plausibility_reason}",
+                current_lat=window_start_lat,
+                current_lon=window_start_lon,
+                current_speed=current_speed,
+                current_azimuth=current_azimuth,
+                window_duration=prediction_dt,
+                corr_result=corr_result,
+                selected_window_size=selected_window_size,
+                measurement_span_m=measurement_span_m,
+                max_offset_m=max_offset_m,
+                heading_override_deg=hinted_azimuth,
+            )
 
     return NavigationDecision(
         fix=solver.solve(
@@ -1859,18 +1960,15 @@ def pipeline_worker(
                 degraded = True
 
             imm_result = imm.update(position_fix, dt=step_dt, is_flat=flat)
-            if not nav_decision.used_prediction_only:
-                current_azimuth = position_fix.azimuth_deg
-                current_speed = position_fix.speed_mps
-            else:
-                current_azimuth = maybe_update_heading_from_correlation(
-                    current_azimuth_deg=current_azimuth,
-                    corr_result=corr_result,
-                    max_offset_m=config.max_offset_m,
-                    selected_window_size=selected_window_size,
-                    measurement_step_m=measurement_step_m,
-                    used_prediction_only=nav_decision.used_prediction_only,
-                )
+            current_speed, current_azimuth = update_motion_state_after_decision(
+                nav_decision=nav_decision,
+                corr_result=corr_result,
+                current_speed=current_speed,
+                current_azimuth=current_azimuth,
+                max_offset_m=config.max_offset_m,
+                selected_window_size=selected_window_size,
+                measurement_step_m=measurement_step_m,
+            )
             output_result = position_fix_to_imm_result(
                 position_fix,
                 model_weights=imm_result.model_weights,

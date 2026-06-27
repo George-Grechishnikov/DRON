@@ -44,6 +44,19 @@ def test_frames_to_terrain_profile_uses_fixed_baro_and_valid_mask() -> None:
     assert np.array_equal(profile.valid_mask, np.array([True, False, True], dtype=bool))
 
 
+def test_frames_to_terrain_profile_masks_invalid_numeric_altitude() -> None:
+    frames = [
+        NMEAFrame(timestamp_utc="123519.000", radar_alt_m=545.4, raw="", valid=True),
+        NMEAFrame(timestamp_utc="123520.000", radar_alt_m=500.0, raw="", valid=False),
+    ]
+
+    profile = frames_to_terrain_profile(frames, BaroTrack(default_msl_m=FIXED_BARO_ALTITUDE_M))
+
+    assert np.isclose(profile.values_m[0], FIXED_BARO_ALTITUDE_M - 545.4)
+    assert np.isnan(profile.values_m[1])
+    assert np.array_equal(profile.valid_mask, np.array([True, False], dtype=bool))
+
+
 def test_frames_to_terrain_profile_applies_terrain_bias_correction() -> None:
     frames = [
         NMEAFrame(timestamp_utc="123519.000", radar_alt_m=480.0, raw="", valid=True),

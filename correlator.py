@@ -9,7 +9,8 @@ from dataclasses import dataclass, field
 from typing import Sequence
 
 import numpy as np
-from scipy.signal import correlate, find_peaks, windows
+from scipy.ndimage import maximum_filter
+from scipy.signal import correlate, windows
 
 from measurement_layer import BaroTrack, frames_to_terrain_profile
 from nmea_parser import NMEAFrame
@@ -618,37 +619,58 @@ class Correlator:
     def compute_ambiguity(heatmap: np.ndarray, step_m: float) -> AmbiguityMetrics:
         """Estimate ambiguity using radar-style peak diagnostics."""
 
-        flat = np.asarray(heatmap, dtype=float).ravel()
-        flat = flat[np.isfinite(flat)]
-        if flat.size == 0:
+        values = np.asarray(heatmap, dtype=float)
+        finite_mask = np.isfinite(values)
+        if values.ndim != 2 or values.size == 0 or not np.any(finite_mask):
             return AmbiguityMetrics(pslr_db=0.0, n_peaks=0, peak_isolation_m=0.0, is_ambiguous=True)
 
-        peak_idx = int(np.nanargmax(flat))
-        peak_val = float(flat[peak_idx])
-        if flat.size == 1:
+        peak_row, peak_col = np.unravel_index(int(np.nanargmax(values)), values.shape)
+        peak_val = float(values[peak_row, peak_col])
+        finite_values = values[finite_mask]
+        if finite_values.size == 1:
             return AmbiguityMetrics(pslr_db=99.0, n_peaks=1, peak_isolation_m=float("inf"), is_ambiguous=False)
 
-        candidate_peaks, properties = find_peaks(flat, height=max(peak_val * 0.8, peak_val - 1e-9), distance=2)
-        if candidate_peaks.size == 0:
-            candidate_peaks = np.array([peak_idx], dtype=int)
-        if peak_idx not in candidate_peaks:
-            candidate_peaks = np.append(candidate_peaks, peak_idx)
-        candidate_peaks = np.unique(candidate_peaks)
+        sanitized = np.where(finite_mask, values, -np.inf)
+        local_max = sanitized == maximum_filter(
+            sanitized,
+            size=(7, 7),
+            mode=("wrap", "nearest"),
+        )
+        peak_drop = max(abs(peak_val) * 0.2, 1e-9)
+        candidate_mask = local_max & finite_mask & (sanitized >= peak_val - peak_drop)
+        candidate_rows, candidate_cols = np.nonzero(candidate_mask)
+        if candidate_rows.size == 0:
+            candidate_rows = np.asarray([peak_row], dtype=int)
+            candidate_cols = np.asarray([peak_col], dtype=int)
+        if not np.any((candidate_rows == peak_row) & (candidate_cols == peak_col)):
+            candidate_rows = np.append(candidate_rows, peak_row)
+            candidate_cols = np.append(candidate_cols, peak_col)
 
-        sorted_values = np.sort(flat)
-        sidelobe = float(sorted_values[-2]) if sorted_values.size > 1 else 1e-10
+        exclusion = np.zeros(values.shape, dtype=bool)
+        row_offsets = np.arange(-3, 4, dtype=int)
+        excluded_rows = (peak_row + row_offsets) % values.shape[0]
+        col_start = max(0, peak_col - 3)
+        col_stop = min(values.shape[1], peak_col + 4)
+        exclusion[np.ix_(excluded_rows, np.arange(col_start, col_stop, dtype=int))] = True
+        sidelobes = sanitized[finite_mask & ~exclusion]
+        sidelobe = float(np.nanmax(sidelobes)) if sidelobes.size else 1e-10
         pslr_db = 20.0 * math.log10((peak_val + 1e-10) / (abs(sidelobe) + 1e-10))
 
-        other_peaks = np.array([idx for idx in candidate_peaks if idx != peak_idx], dtype=int)
-        if other_peaks.size == 0:
+        other_mask = ~((candidate_rows == peak_row) & (candidate_cols == peak_col))
+        if not np.any(other_mask):
             peak_isolation_m = float("inf")
         else:
-            peak_isolation_m = float(np.min(np.abs(other_peaks - peak_idx))) * step_m
+            row_delta = np.abs(candidate_rows[other_mask] - peak_row)
+            cyclic_row_delta = np.minimum(row_delta, values.shape[0] - row_delta)
+            col_delta_m = (candidate_cols[other_mask] - peak_col) * step_m
+            azimuth_delta_m = cyclic_row_delta * (step_m * max(values.shape[1], 1) * math.pi / 180.0)
+            peak_isolation_m = float(np.min(np.hypot(col_delta_m, azimuth_delta_m)))
 
-        is_ambiguous = pslr_db < 3.0 or candidate_peaks.size > 2
+        peak_count = int(candidate_rows.size)
+        is_ambiguous = pslr_db < 3.0 or peak_count > 2
         return AmbiguityMetrics(
             pslr_db=pslr_db,
-            n_peaks=int(candidate_peaks.size),
+            n_peaks=peak_count,
             peak_isolation_m=peak_isolation_m,
             is_ambiguous=is_ambiguous,
         )
