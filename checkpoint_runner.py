@@ -80,6 +80,19 @@ def validate_nmea_file(path: Path) -> tuple[int, float | None]:
             f"inferred {inferred_freq_hz:.2f} Hz from timestamps"
         )
     return len(valid_frames), float(inferred_freq_hz)
+def resolve_runtime_window_params(
+    sample_count: int,
+    requested_window_size: int,
+    requested_step_size: int,
+) -> tuple[int, int]:
+    """Clamp replay window parameters to the actual uploaded track length."""
+
+    if sample_count <= 1:
+        raise ValueError("Need at least 2 height samples to build a terrain window")
+
+    effective_window_size = max(2, min(int(requested_window_size), int(sample_count)))
+    effective_step_size = max(1, min(int(requested_step_size), effective_window_size))
+    return effective_window_size, effective_step_size
 
 
 def write_nmea_from_heights(
@@ -346,7 +359,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         resolved_xy_mode = "dem-center"
     else:
         start_lat, start_lon, resolved_xy_mode = resolve_start_latlon(args.dem, float(args.start_x), float(args.start_y), args.xy_mode)
-
     args.out_dir.mkdir(parents=True, exist_ok=True)
     nmea_path = args.out_dir / "case_input.nmea"
     csv_path = args.out_dir / "trajectory_estimated.csv"
@@ -357,12 +369,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         freq_hz = float(args.freq if args.freq is not None else (inferred_freq_hz if inferred_freq_hz is not None else 5.0))
         if not (1.0 <= freq_hz <= 10.0):
             parser.error("--freq must be within 1-10 Hz by case requirements")
+        sample_count = valid_count
     else:
         if args.freq is None:
             parser.error("--freq is required when --heights is used")
         if not (1.0 <= float(args.freq) <= 10.0):
             parser.error("--freq must be within 1-10 Hz by case requirements")
         heights_m = read_heights(args.heights)
+        sample_count = len(heights_m)
         write_nmea_from_heights(
             heights_m=heights_m,
             output_path=nmea_path,
@@ -372,6 +386,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         valid_count, _ = validate_nmea_file(nmea_path)
         freq_hz = float(args.freq)
+
+    effective_window_size, effective_step_size = resolve_runtime_window_params(
+        sample_count,
+        int(args.window_size),
+        int(args.step_size),
+    )
 
     config = Config(
         mode="replay",
@@ -394,12 +414,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         altitude_msl_m=float(args.baro_alt),
         noise_sigma=2.0,
         initial_heading_deg=float(args.heading % 360.0),
-        window_size=int(args.window_size),
+        window_size=effective_window_size,
         adaptive_window=False,
-        min_window_size=int(args.window_size),
-        max_window_size=int(args.window_size),
-        window_growth_step=int(args.step_size),
-        step_size=int(args.step_size),
+        min_window_size=effective_window_size,
+        max_window_size=effective_window_size,
+        window_growth_step=effective_step_size,
+        step_size=effective_step_size,
         freq_hz=freq_hz,
         dem_patch_radius_m=float(args.dem_patch_radius),
         max_offset_m=float(args.max_offset),
@@ -432,6 +452,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"Resolved start: lat={start_lat:.8f}, lon={start_lon:.8f}, xy_mode={resolved_xy_mode}")
     print(f"NMEA input: {nmea_path}")
     print(f"Valid NMEA frames: {valid_count}, freq_hz={freq_hz:.3f}")
+    print(
+        "Effective window params: "
+        f"window_size={effective_window_size}, step_size={effective_step_size}, samples={sample_count}"
+    )
     print(f"Trajectory CSV: {csv_path}")
     print(f"Visualization HTML: {html_path}")
     print(f"Estimated points: {len(history)}")
