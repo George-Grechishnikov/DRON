@@ -2709,6 +2709,20 @@ def demo_dashboard_worker(
         "state_payloads_enqueued": 0,
     }
 
+    def emit_idle_state(message: str) -> None:
+        """Publish an explicit idle dashboard state with cleared route history."""
+
+        _enqueue_state(
+            state_queue,
+            {
+                "dashboard_idle": True,
+                "idle_message": str(message),
+                "route_history": [],
+                "runtime_stats": runtime_stats.copy(),
+            },
+            stop_event,
+        )
+
     with DEMLoader(config.dem_path) as dem:
         extractor = ProfileExtractor(
             dem,
@@ -2732,7 +2746,14 @@ def demo_dashboard_worker(
         gnss_outage_frames = 0
         sample_counter = 0
 
+        emit_idle_state("Ожидание запуска. Сначала загрузите данные по кейсу и нажмите СТАРТ / ЗАНОВО.")
+        restart_requested = False
         while not stop_event.is_set():
+            if not restart_requested:
+                gnss_override, restart_requested = _drain_demo_control_queue(control_queue, gnss_override)
+                time.sleep(0.05)
+                continue
+            restart_requested = False
             buffer.clear()
             route_history.clear()
             last_corr_index = -10_000
@@ -2752,7 +2773,9 @@ def demo_dashboard_worker(
                     )
 
                 tick_started_s = time.perf_counter()
-                gnss_override, _ = _drain_demo_control_queue(control_queue, gnss_override)
+                gnss_override, restart_requested = _drain_demo_control_queue(control_queue, gnss_override)
+                if restart_requested:
+                    break
                 gnss_available = True if gnss_override is None else bool(gnss_override)
                 if gnss_available:
                     gnss_outage_frames = 0
@@ -2878,7 +2901,7 @@ def demo_dashboard_worker(
                         "ref": last_ref,
                         "dem_patch": dem_patch,
                         "dem_patch_transform": tuple(float(value) for value in dem_patch_transform[:6]),
-                        "route_history": route_history[-500:],
+                        "route_history": list(route_history),
                         "hdop": hdop_m,
                         "nav_mode": nav_mode,
                         "used_prediction_only": False,
@@ -2910,11 +2933,11 @@ def demo_dashboard_worker(
                 )
                 sample_counter += 1
 
-            while not stop_event.is_set():
+            while not stop_event.is_set() and not restart_requested:
                 gnss_override, restart_requested = _drain_demo_control_queue(control_queue, gnss_override)
-                if restart_requested:
-                    break
                 time.sleep(0.05)
+            if not restart_requested and not stop_event.is_set():
+                emit_idle_state("Маршрут завершён. Для нового прогона нажмите СТАРТ / ЗАНОВО.")
 
     return history
 

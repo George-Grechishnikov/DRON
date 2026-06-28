@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import math
 import logging
 import queue
@@ -19,6 +22,37 @@ from imm_filter import IMMResult
 
 
 LOGGER = logging.getLogger(__name__)
+CHECKPOINT_UPLOAD_DIR = Path("output") / "checkpoint_uploads" / "latest"
+
+
+def _safe_upload_filename(filename: str | None, fallback: str) -> str:
+    """Return a filesystem-safe basename for an uploaded file."""
+
+    if not filename:
+        return fallback
+    candidate = Path(str(filename)).name.strip()
+    return candidate or fallback
+
+
+def _decode_upload_contents(contents: str) -> bytes:
+    """Decode a Dash upload payload into raw bytes."""
+
+    if "," not in contents:
+        raise ValueError("Некорректный формат upload payload")
+    _, encoded = contents.split(",", 1)
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("Не удалось декодировать загруженный файл") from exc
+
+
+def _store_uploaded_file(contents: str, filename: str | None, destination_dir: Path, fallback: str) -> Path:
+    """Persist an uploaded file in the checkpoint workspace."""
+
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    path = destination_dir / _safe_upload_filename(filename, fallback)
+    path.write_bytes(_decode_upload_contents(contents))
+    return path
 
 
 def _meters_to_lat_deg(distance_m: float) -> float:
@@ -381,6 +415,18 @@ class TerrainNavigatorDash:
             "boxShadow": "0 0 22px rgba(33, 142, 255, 0.20)",
         }
 
+        section_active_style = {"position": "relative", "width": "100%", "display": "block"}
+        section_hidden_style = {
+            "position": "absolute",
+            "left": "-200vw",
+            "top": "0",
+            "width": "100%",
+            "height": "0",
+            "overflow": "hidden",
+            "opacity": "0",
+            "pointerEvents": "none",
+        }
+
         return html.Div(
             style={
                 "background": (
@@ -397,318 +443,320 @@ class TerrainNavigatorDash:
             className="adriadna-shell",
             children=[
                 html.Div(
-                    style={
-                        **panel_style,
-                        "display": "flex",
-                        "alignItems": "center",
-                        "justifyContent": "space-between",
-                        "gap": "12px",
-                        "padding": "11px 14px",
-                        "marginBottom": "10px",
-                        "borderColor": "rgba(79, 155, 210, 0.70)",
-                    },
+                    style={"width": "100%", "margin": "0 auto"},
                     children=[
                         html.Div(
-                            style={"display": "flex", "alignItems": "center", "gap": "12px"},
-                            children=[
-                                html.Div(
-                                    "✦",
-                                    style={
-                                        "width": "34px",
-                                        "height": "34px",
-                                        "borderRadius": "12px",
-                                        "display": "grid",
-                                        "placeItems": "center",
-                                        "background": "linear-gradient(135deg, #12a2ff, #4fffd2)",
-                                        "color": "#04101c",
-                                        "fontSize": "18px",
-                                        "fontWeight": "900",
-                                        "boxShadow": "0 0 28px rgba(55, 210, 255, 0.34)",
-                                    },
-                                ),
-                                html.Div(
-                                    children=[
-                                        html.Div("Адриадна | Симуляция полета БПЛА", style={"fontSize": "23px", "fontWeight": "900", "lineHeight": "1.05", "letterSpacing": "0.01em"}),
-                                        html.Div(
-                                            "Поиск БПЛА после потери GNSS по DEM и радиовысотомеру",
-                                            style={"fontSize": "12px", "color": "#9fc6dd", "marginTop": "4px"},
-                                        ),
-                                    ]
-                                ),
-                            ],
-                        ),
-                        html.Div(
-                            style={"display": "flex", "gap": "8px", "alignItems": "center", "flexWrap": "wrap", "justifyContent": "flex-end"},
-                            children=[
-                                html.Div("GNSS: OFF/ON", style={**pill_style, "color": "#ff6679", "borderColor": "rgba(255, 85, 110, 0.48)"}),
-                                html.Div("Режим: TERRAIN_NAV", style={**pill_style, "color": "#38d7ff"}),
-                                html.Div("Сенсоры: OK", style={**pill_style, "color": "#7CFF8A", "borderColor": "rgba(73, 220, 110, 0.48)"}),
-                                html.Div("Частота: 10 Гц", style={**pill_style, "color": "#63a7ff"}),
-                                html.Div("Корреляция: LIVE", style={**pill_style, "color": "#c781ff", "borderColor": "rgba(181, 92, 255, 0.46)"}),
-                    ],
-                ),
-                dcc.Store(id="history-store", data={"history": []}),
-                dcc.Interval(id="dashboard-interval", interval=100, n_intervals=0),
-                dcc.RadioItems(
-                    id="app-sections",
-                    value="flight",
-                    options=[
-                        {"label": "Полет и управление", "value": "flight"},
-                        {"label": "Профиль и качество", "value": "profile"},
-                    ],
-                    inline=True,
-                    className="section-switcher",
-                    style={"display": "flex", "gap": "8px", "margin": "8px 0 10px 0"},
-                    labelStyle=tab_style,
-                    inputStyle={"display": "none"},
-                ),
-                html.Div(
-                    id="flight-section",
-                    style={"display": "block"},
-                    children=[
-                        html.Div(
-                            style={"display": "grid", "gridTemplateColumns": "minmax(560px, 1.42fr) minmax(420px, 0.92fr)", "gap": "10px", "alignItems": "stretch"},
-                    children=[
-                        html.Div(
-                            style=panel_style,
-                            children=[
-                                html.Div("Карта траектории (DEM)", style=panel_title_style),
-                                dcc.Graph(id="terrain-map", config=graph_config, style={"height": "48vh", "minHeight": "430px"}),
-                            ],
-                        ),
-                        html.Div(
-                            style={**panel_style, "padding": "12px", "display": "flex", "flexDirection": "column", "gap": "10px"},
-                            children=[
-                                html.Div(
-                                    style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "9px"},
-                                    children=[
-                                        html.Button("Загрузить данные", disabled=True, style={**button_style, "backgroundColor": "#13263a", "border": "1px solid #31536e", "color": "#9fbdd4"}),
-                                        html.Button("СТАРТ / ЗАНОВО", id="route-restart-button", n_clicks=0, style={**button_style, "backgroundColor": "#005bd8", "border": "1px solid #5fa8ff"}),
-                                        html.Button("GNSS ВЫКЛ", id="gnss-off-button", n_clicks=0, style={**button_style, "backgroundColor": "#9e1f31", "border": "1px solid #ff5b6c"}),
-                                        html.Button("GNSS ВКЛ", id="gnss-on-button", n_clicks=0, style={**button_style, "backgroundColor": "#126c3a", "border": "1px solid #34d27c"}),
-                                    ],
-                                ),
-                                html.Div(
-                                    id="control-status",
-                                    style={
-                                        "padding": "10px 12px",
-                                        "backgroundColor": "rgba(9, 30, 47, 0.9)",
-                                        "border": "1px solid rgba(72, 132, 174, 0.58)",
-                                        "borderRadius": "10px",
-                                        "color": "#bfe3ff",
-                                        "fontWeight": "700",
-                                    },
-                                    children="Управление готово",
-                                ),
-                                html.Div(
-                                    style={"display": "grid", "gridTemplateColumns": "0.92fr 1.08fr", "gap": "14px", "alignItems": "stretch"},
-                                    children=[
-                                        html.Div(
-                                            children=[
-                                                html.Div("СКОРОСТЬ ПОВТОРА", style={"fontSize": "11px", "fontWeight": "900", "color": "#d8ecff", "marginBottom": "7px"}),
-                                                html.Div(
-                                                    style={"display": "grid", "gridTemplateColumns": "repeat(4, 1fr)", "gap": "7px"},
-                                                    children=[
-                                                        html.Div("1x", style={**speed_button_style, "background": "linear-gradient(180deg, #1267dc, #0640a5)", "borderColor": "#3f91ff"}),
-                                                        html.Div("2x", style=speed_button_style),
-                                                        html.Div("5x", style=speed_button_style),
-                                                        html.Div("10x", style=speed_button_style),
-                                                    ],
-                                                ),
-                                            ],
-                                        ),
-                                        html.Div(
-                                            children=[
-                                                html.Div("ВРЕМЯ СИМУЛЯЦИИ", style={"fontSize": "11px", "fontWeight": "900", "color": "#d8ecff", "marginBottom": "7px"}),
-                                                html.Div(
-                                                    style={"display": "grid", "gridTemplateColumns": "70px 1fr 70px", "gap": "8px", "alignItems": "center"},
-                                                    children=[
-                                                        html.Div("00:07:42", style={"color": "#d8ecff", "fontWeight": "800", "fontSize": "12px"}),
-                                                        html.Div(
-                                                            style={"height": "6px", "borderRadius": "999px", "background": "linear-gradient(90deg, #1797ff 0 44%, #284157 44% 100%)", "boxShadow": "0 0 14px rgba(23, 151, 255, 0.28)"},
-                                                        ),
-                                                        html.Div("00:20:00", style={"color": "#d8ecff", "fontWeight": "800", "fontSize": "12px", "textAlign": "right"}),
-                                                    ],
-                                                ),
-                                            ],
-                                        ),
-                                    ],
-                                ),
-                                html.Div("Текущие метрики", style={**panel_title_style, "padding": "0", "marginTop": "2px"}),
-                                html.Div(
-                                    id="metrics-panel",
-                                    style={
-                                        "display": "grid",
-                                        "gridTemplateColumns": "repeat(4, minmax(92px, 1fr))",
-                                        "gap": "7px",
-                                        "maxHeight": "210px",
-                                        "overflowY": "auto",
-                                        "paddingRight": "3px",
-                                    },
-                                ),
-                                html.Div(
-                                    style={"display": "grid", "gridTemplateColumns": "repeat(2, 1fr)", "gap": "8px", "marginTop": "auto"},
-                                    children=[
-                                        html.Div(
-                                            style=micro_card_style,
-                                            children=[
-                                                html.Div("Высота баро", style={"fontSize": "11px", "color": "#8fb7d4"}),
-                                                html.Div("1500 м", style={"fontSize": "21px", "fontWeight": "900", "color": "#ffd166"}),
-                                            ],
-                                        ),
-                                        html.Div(
-                                            style=micro_card_style,
-                                            children=[
-                                                html.Div("Задача", style={"fontSize": "11px", "color": "#8fb7d4"}),
-                                                html.Div("Найти БПЛА", style={"fontSize": "20px", "fontWeight": "900", "color": "#ffe66d"}),
-                                            ],
-                                        ),
-                                    ],
-                                ),
-                            ],
-                        ),
-                    ],
-                ),
-                html.Div(
-                    style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "8px", "marginTop": "8px"},
-                    children=[
-                        html.Div(style=panel_style, children=[html.Div("Профиль высоты", style=panel_title_style), dcc.Graph(id="profiles-graph", config=graph_config, style={"height": "25vh", "minHeight": "230px"})]),
-                        html.Div(style=panel_style, children=[html.Div("Корреляция рельефа", style=panel_title_style), dcc.Graph(id="correlation-heatmap", config=graph_config, style={"height": "25vh", "minHeight": "230px"})]),
-                    ],
-                ),
-                html.Div(
-                    style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "8px", "marginTop": "8px"},
-                    children=[
-                        html.Div(
-                            style={**panel_style, "padding": "12px"},
-                            children=[
-                                html.Div("Временная шкала режимов", style={**panel_title_style, "padding": "0 0 10px 0"}),
-                                html.Div(
-                                    style={"height": "32px", "display": "grid", "gridTemplateColumns": "1.2fr 0.95fr 2.0fr 0.75fr 1.1fr", "borderRadius": "6px", "overflow": "hidden", "border": "1px solid rgba(70, 130, 170, 0.44)"},
-                                    children=[
-                                        html.Div("GNSS ON", style={"background": "#17682f", "display": "grid", "placeItems": "center", "fontWeight": "800", "fontSize": "11px"}),
-                                        html.Div("GNSS LOST", style={"background": "#8d1f2d", "display": "grid", "placeItems": "center", "fontWeight": "800", "fontSize": "11px"}),
-                                        html.Div("TERRAIN_NAV", style={"background": "#0b54c7", "display": "grid", "placeItems": "center", "fontWeight": "800", "fontSize": "11px"}),
-                                        html.Div("ПАУЗА", style={"background": "#535b66", "display": "grid", "placeItems": "center", "fontWeight": "800", "fontSize": "11px"}),
-                                        html.Div("GNSS ON", style={"background": "#17682f", "display": "grid", "placeItems": "center", "fontWeight": "800", "fontSize": "11px"}),
-                                    ],
-                                ),
-                                html.Div(
-                                    style={"display": "grid", "gridTemplateColumns": "repeat(5, 1fr)", "gap": "6px", "marginTop": "12px", "color": "#9fc4dc", "fontSize": "12px"},
-                                    children=[
-                                        html.Div("00:00 старт"),
-                                        html.Div("GNSS loss"),
-                                        html.Div("terrain nav"),
-                                        html.Div("reacquire"),
-                                        html.Div("финиш"),
-                                    ],
-                                ),
-                            ],
-                        ),
-                        html.Div(
-                            style={**panel_style, "padding": "0"},
-                            children=[
-                                html.Div("Журнал событий", style={**panel_title_style, "padding": "10px 12px"}),
-                                html.Div(style=event_header_style, children=[html.Div("Время"), html.Div("Уровень"), html.Div("Событие"), html.Div("Детали")]),
-                                html.Div(
-                                    style={"maxHeight": "176px", "overflowY": "auto"},
-                                    children=[
-                                        event_row("00:03:48", "WARN", "#9e6a12", "Потеря сигнала GNSS", "SNR ниже порога, спутников: 2/12"),
-                                        event_row("00:04:08", "INFO", "#0f65b8", "Начало поиска рельефа", "Переключение на TERRAIN_NAV через 60 с"),
-                                        event_row("00:07:42", "INFO", "#0f65b8", "Переход в TERRAIN_NAV", "Режим навигации по рельефу активирован"),
-                                        event_row("00:07:42", "INFO", "#1c8d49", "Обновление позиции", "NCC=0.82, азимут=129.3°, смещение=+6.2 м"),
-                                        event_row("00:07:42", "DEBUG", "#34506a", "Метрики обновлены", "Ошибка 3D=18.6 м, ошибка 2D=14.2 м"),
-                                    ],
-                                ),
-                                dcc.Graph(id="telemetry-graph", config=graph_config, style={"display": "none"}),
-                            ],
-                        ),
-                    ],
-                ),
-                    ],
-                ),
-                html.Div(
-                    id="profile-section",
-                    style={"display": "none"},
-                    children=[
-                                html.Div(
-                    style={
-                        "marginTop": "12px",
-                        "paddingTop": "10px",
-                        "borderTop": "1px solid rgba(55, 105, 142, 0.55)",
-                    },
-                    children=[
-                        html.Div(
-                            "Экран 2. Анализ профиля высоты и качества сигналов",
                             style={
-                                "fontSize": "15px",
-                                "fontWeight": "900",
-                                "letterSpacing": "0.05em",
-                                "textTransform": "uppercase",
-                                "color": "#eaf6ff",
-                                "marginBottom": "8px",
+                                **panel_style,
+                                "display": "grid",
+                                "gridTemplateColumns": "minmax(320px, 1.1fr) minmax(420px, 1fr)",
+                                "gap": "16px",
+                                "padding": "14px 16px",
+                                "marginBottom": "12px",
+                                "borderColor": "rgba(79, 155, 210, 0.70)",
                             },
-                        ),
-                        html.Div(
-                            style={"display": "grid", "gridTemplateColumns": "1fr 260px", "gap": "8px", "alignItems": "stretch"},
                             children=[
                                 html.Div(
-                                    style={"display": "grid", "gridTemplateRows": "1fr 0.8fr 1fr", "gap": "8px"},
+                                    style={"display": "flex", "alignItems": "center", "gap": "14px"},
                                     children=[
-                                        html.Div(style=panel_style, children=[html.Div("1. Профиль высоты", style=panel_title_style), dcc.Graph(id="altitude-profile-screen", config=graph_config, style={"height": "28vh", "minHeight": "235px"})]),
-                                        html.Div(style=panel_style, children=[html.Div("2. Скорость и курс", style=panel_title_style), dcc.Graph(id="speed-heading-screen", config=graph_config, style={"height": "21vh", "minHeight": "185px"})]),
-                                        html.Div(style=panel_style, children=[html.Div("3. Сигналы датчиков", style=panel_title_style), dcc.Graph(id="sensor-signals-screen", config=graph_config, style={"height": "25vh", "minHeight": "220px"})]),
+                                        html.Div(
+                                            "✦",
+                                            style={
+                                                "width": "42px",
+                                                "height": "42px",
+                                                "borderRadius": "14px",
+                                                "display": "grid",
+                                                "placeItems": "center",
+                                                "background": "linear-gradient(135deg, #12a2ff, #4fffd2)",
+                                                "color": "#04101c",
+                                                "fontSize": "20px",
+                                                "fontWeight": "900",
+                                                "boxShadow": "0 0 28px rgba(55, 210, 255, 0.34)",
+                                            },
+                                        ),
+                                        html.Div(
+                                            children=[
+                                                html.Div("Адриадна | Симуляция полета БПЛА", style={"fontSize": "24px", "fontWeight": "900", "lineHeight": "1.05"}),
+                                                html.Div("Поиск БПЛА после потери GNSS по DEM и радиовысотомеру", style={"fontSize": "12px", "color": "#9fc6dd", "marginTop": "4px"}),
+                                            ],
+                                        ),
                                     ],
                                 ),
-                                html.Div(id="profile-stats-panel", style={"display": "grid", "gap": "8px"}),
+                                html.Div(
+                                    style={"display": "flex", "gap": "8px", "alignItems": "center", "flexWrap": "wrap", "justifyContent": "flex-end"},
+                                    children=[
+                                        html.Div("GNSS: OFF/ON", style={**pill_style, "color": "#ff6679", "borderColor": "rgba(255, 85, 110, 0.48)"}),
+                                        html.Div("Режим: TERRAIN_NAV", style={**pill_style, "color": "#38d7ff"}),
+                                        html.Div("Сенсоры: OK", style={**pill_style, "color": "#7CFF8A", "borderColor": "rgba(73, 220, 110, 0.48)"}),
+                                        html.Div("Частота: 10 Гц", style={**pill_style, "color": "#63a7ff"}),
+                                        html.Div("Корреляция: LIVE", style={**pill_style, "color": "#c781ff", "borderColor": "rgba(181, 92, 255, 0.46)"}),
+                                    ],
+                                ),
                             ],
                         ),
+                        dcc.Store(id="history-store", data={"history": []}),
+                        dcc.Store(id="checkpoint-upload-store", data={}),
+                        dcc.Interval(id="dashboard-interval", interval=500, n_intervals=0),
+                        dcc.RadioItems(
+                            id="app-sections",
+                            value="flight",
+                            options=[
+                                {"label": "Полет и управление", "value": "flight"},
+                                {"label": "Профиль и качество", "value": "profile"},
+                            ],
+                            inline=True,
+                            className="section-switcher",
+                            style={"display": "flex", "gap": "10px", "margin": "0 0 12px 0", "justifyContent": "flex-start"},
+                            labelStyle=tab_style,
+                            inputStyle={"display": "none"},
+                        ),
                         html.Div(
-                            style={"display": "grid", "gridTemplateColumns": "1fr 300px", "gap": "8px", "marginTop": "8px"},
+                            id="sections-host",
+                            style={"position": "relative", "width": "100%", "minHeight": "900px"},
                             children=[
                                 html.Div(
-                                    style={**panel_style, "padding": "14px"},
+                                    id="flight-section",
+                                    style=section_active_style,
                                     children=[
-                                        html.Div("Формула восстановления профиля рельефа", style={**panel_title_style, "padding": "0 0 10px 0"}),
                                         html.Div(
-                                            style={"display": "grid", "gridTemplateColumns": "360px 1fr 1fr", "gap": "18px", "alignItems": "center"},
+                                            style={"display": "grid", "gridTemplateColumns": "minmax(980px, 2.15fr) minmax(360px, 0.72fr)", "gap": "12px", "alignItems": "stretch"},
                                             children=[
                                                 html.Div(
-                                                    "terrain_profile = baro_alt_m - radar_alt_m",
-                                                    style={
-                                                        "border": "1px solid rgba(81, 130, 161, 0.7)",
-                                                        "borderRadius": "8px",
-                                                        "padding": "16px",
-                                                        "fontSize": "18px",
-                                                        "fontFamily": "Consolas, monospace",
-                                                        "background": "rgba(8, 22, 34, 0.95)",
-                                                        "color": "#ffffff",
-                                                    },
-                                                ),
-                                                html.Div(
+                                                    style=panel_style,
                                                     children=[
-                                                        html.Div("terrain_profile", style={"color": "#7CFF8A", "fontFamily": "Consolas, monospace", "fontWeight": "900"}),
-                                                        html.Div("восстановленный профиль рельефа, м", style={"color": "#9fbdd4", "fontSize": "12px"}),
-                                                        html.Div("baro_alt_m", style={"color": "#caff73", "fontFamily": "Consolas, monospace", "fontWeight": "900", "marginTop": "8px"}),
-                                                        html.Div("барометрическая высота, м", style={"color": "#9fbdd4", "fontSize": "12px"}),
+                                                        html.Div("Карта траектории (DEM)", style=panel_title_style),
+                                                        dcc.Graph(id="terrain-map", config=graph_config, style={"height": "52vh", "minHeight": "480px"}),
                                                     ],
                                                 ),
                                                 html.Div(
+                                                    style={**panel_style, "padding": "12px", "display": "flex", "flexDirection": "column", "gap": "10px"},
                                                     children=[
-                                                        html.Div("radar_alt_m", style={"color": "#57d6ff", "fontFamily": "Consolas, monospace", "fontWeight": "900"}),
-                                                        html.Div("высота по радиовысотомеру AGL, м", style={"color": "#9fbdd4", "fontSize": "12px"}),
-                                                        html.Div("Все высоты приведены в метрах.", style={"color": "#cfe7fa", "fontSize": "12px", "marginTop": "10px"}),
+                                                        html.Div(
+                                                            style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "9px"},
+                                                            children=[
+                                                                html.Button("Загрузить данные", id="checkpoint-load-button", n_clicks=0, style={**button_style, "backgroundColor": "#13263a", "border": "1px solid #5fa8ff", "color": "#eaf6ff"}),
+                                                                html.Button("СТАРТ / ЗАНОВО", id="route-restart-button", n_clicks=0, style={**button_style, "backgroundColor": "#005bd8", "border": "1px solid #5fa8ff"}),
+                                                                html.Button("GNSS ВЫКЛ", id="gnss-off-button", n_clicks=0, style={**button_style, "backgroundColor": "#9e1f31", "border": "1px solid #ff5b6c"}),
+                                                                html.Button("GNSS ВКЛ", id="gnss-on-button", n_clicks=0, style={**button_style, "backgroundColor": "#126c3a", "border": "1px solid #34d27c"}),
+                                                            ],
+                                                        ),
+                                                        html.Div(
+                                                            style={
+                                                                "display": "grid",
+                                                                "gap": "8px",
+                                                                "padding": "12px",
+                                                                "borderRadius": "12px",
+                                                                "background": "rgba(5, 18, 31, 0.92)",
+                                                                "border": "1px solid rgba(63, 122, 163, 0.46)",
+                                                            },
+                                                            children=[
+                                                                html.Div("Чекпоинт: входные данные по кейсу", style={"fontSize": "11px", "fontWeight": "900", "textTransform": "uppercase", "letterSpacing": "0.06em", "color": "#d6edff"}),
+                                                                html.Div(
+                                                                    style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "8px"},
+                                                                    children=[
+                                                                        dcc.Upload(
+                                                                            id="checkpoint-heights-upload",
+                                                                            children=html.Div("Файл высот (txt)", style={"padding": "10px 12px", "textAlign": "center", "borderRadius": "10px", "border": "1px dashed rgba(119, 171, 208, 0.7)", "background": "rgba(10, 29, 47, 0.86)", "fontWeight": "700", "color": "#cfe7fa"}),
+                                                                            multiple=False,
+                                                                        ),
+                                                                        dcc.Upload(
+                                                                            id="checkpoint-dem-upload",
+                                                                            children=html.Div("DEM GeoTIFF", style={"padding": "10px 12px", "textAlign": "center", "borderRadius": "10px", "border": "1px dashed rgba(119, 171, 208, 0.7)", "background": "rgba(10, 29, 47, 0.86)", "fontWeight": "700", "color": "#cfe7fa"}),
+                                                                            multiple=False,
+                                                                        ),
+                                                                    ],
+                                                                ),
+                                                                html.Div(id="checkpoint-upload-filenames", style={"fontSize": "12px", "color": "#9fc4dc", "lineHeight": "1.45"}, children="Загрузите `heights.txt` и GeoTIFF, затем укажите start x/y, heading, speed, freq."),
+                                                                html.Div(
+                                                                    style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "8px"},
+                                                                    children=[
+                                                                        dcc.Input(id="checkpoint-start-x", type="number", placeholder="start x", debounce=True, style={"width": "100%", "padding": "10px 12px", "borderRadius": "10px", "border": "1px solid rgba(90, 145, 180, 0.55)", "background": "#071827", "color": "#f3fbff"}),
+                                                                        dcc.Input(id="checkpoint-start-y", type="number", placeholder="start y", debounce=True, style={"width": "100%", "padding": "10px 12px", "borderRadius": "10px", "border": "1px solid rgba(90, 145, 180, 0.55)", "background": "#071827", "color": "#f3fbff"}),
+                                                                        dcc.Input(id="checkpoint-heading", type="number", placeholder="heading, deg", debounce=True, style={"width": "100%", "padding": "10px 12px", "borderRadius": "10px", "border": "1px solid rgba(90, 145, 180, 0.55)", "background": "#071827", "color": "#f3fbff"}),
+                                                                        dcc.Input(id="checkpoint-speed", type="number", value=50, debounce=True, placeholder="speed, m/s", style={"width": "100%", "padding": "10px 12px", "borderRadius": "10px", "border": "1px solid rgba(90, 145, 180, 0.55)", "background": "#071827", "color": "#f3fbff"}),
+                                                                        dcc.Input(id="checkpoint-freq", type="number", value=10, debounce=True, placeholder="freq, Hz", style={"width": "100%", "padding": "10px 12px", "borderRadius": "10px", "border": "1px solid rgba(90, 145, 180, 0.55)", "background": "#071827", "color": "#f3fbff"}),
+                                                                        dcc.Dropdown(
+                                                                            id="checkpoint-xy-mode",
+                                                                            options=[
+                                                                                {"label": "auto", "value": "auto"},
+                                                                                {"label": "pixel", "value": "pixel"},
+                                                                                {"label": "crs", "value": "crs"},
+                                                                                {"label": "local-m", "value": "local-m"},
+                                                                            ],
+                                                                            value="auto",
+                                                                            clearable=False,
+                                                                            style={"color": "#081420"},
+                                                                        ),
+                                                                    ],
+                                                                ),
+                                                                html.Div(
+                                                                    id="checkpoint-status",
+                                                                    style={
+                                                                        "padding": "10px 12px",
+                                                                        "borderRadius": "10px",
+                                                                        "background": "rgba(9, 30, 47, 0.9)",
+                                                                        "border": "1px solid rgba(72, 132, 174, 0.58)",
+                                                                        "color": "#bfe3ff",
+                                                                        "fontSize": "12px",
+                                                                        "lineHeight": "1.45",
+                                                                        "whiteSpace": "pre-wrap",
+                                                                    },
+                                                                    children="Набор по кейсу еще не загружен.",
+                                                                ),
+                                                            ],
+                                                        ),
+                                                        html.Div(
+                                                            id="control-status",
+                                                            style={
+                                                                "padding": "10px 12px",
+                                                                "backgroundColor": "rgba(9, 30, 47, 0.9)",
+                                                                "border": "1px solid rgba(72, 132, 174, 0.58)",
+                                                                "borderRadius": "10px",
+                                                                "color": "#bfe3ff",
+                                                                "fontWeight": "700",
+                                                            },
+                                                            children="Управление готово",
+                                                        ),
+                                                        html.Div(
+                                                            children=[
+                                                                html.Div("ВРЕМЯ СИМУЛЯЦИИ", style={"fontSize": "11px", "fontWeight": "900", "color": "#d8ecff", "marginBottom": "7px"}),
+                                                                html.Div(
+                                                                    style={"display": "grid", "gridTemplateColumns": "80px 1fr 80px", "gap": "8px", "alignItems": "center"},
+                                                                    children=[
+                                                                        html.Div("00:00:00", style={"color": "#d8ecff", "fontWeight": "800", "fontSize": "12px"}),
+                                                                        html.Div(style={"height": "6px", "borderRadius": "999px", "background": "linear-gradient(90deg, #1797ff 0 44%, #284157 44% 100%)", "boxShadow": "0 0 14px rgba(23, 151, 255, 0.28)"}),
+                                                                        html.Div("REPLAY", style={"color": "#d8ecff", "fontWeight": "800", "fontSize": "12px", "textAlign": "right"}),
+                                                                    ],
+                                                                ),
+                                                            ],
+                                                        ),
+                                                        html.Div(style={"flex": "1 1 auto"}),
+                                                    ],
+                                                ),
+                                            ],
+                                        ),
+                                        html.Div(
+                                            style={"display": "grid", "gridTemplateColumns": "minmax(0, 1.75fr) minmax(280px, 0.75fr)", "gap": "12px", "marginTop": "12px"},
+                                            children=[
+                                                html.Div(
+                                                    style={**panel_style, "padding": "12px"},
+                                                    children=[
+                                                        html.Div("Текущие метрики", style={**panel_title_style, "padding": "0 0 10px 0"}),
+                                                        html.Div(
+                                                            id="metrics-panel",
+                                                            style={
+                                                                "display": "grid",
+                                                                "gridTemplateColumns": "repeat(4, minmax(150px, 1fr))",
+                                                                "gap": "10px",
+                                                                "alignItems": "stretch",
+                                                            },
+                                                        ),
+                                                    ],
+                                                ),
+                                                html.Div(
+                                                    style={**panel_style, "padding": "12px", "display": "grid", "gridTemplateColumns": "1fr", "gap": "8px", "alignContent": "start"},
+                                                    children=[
+                                                        html.Div(style=micro_card_style, children=[html.Div("Высота баро", style={"fontSize": "11px", "color": "#8fb7d4"}), html.Div("1500 м", style={"fontSize": "21px", "fontWeight": "900", "color": "#ffd166"})]),
+                                                        html.Div(style=micro_card_style, children=[html.Div("Задача", style={"fontSize": "11px", "color": "#8fb7d4"}), html.Div("Найти БПЛА", style={"fontSize": "20px", "fontWeight": "900", "color": "#ffe66d"})]),
+                                                    ],
+                                                ),
+                                            ],
+                                        ),
+                                        html.Div(
+                                            style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "12px", "marginTop": "12px"},
+                                            children=[
+                                                html.Div(style=panel_style, children=[html.Div("Профиль высоты", style=panel_title_style), dcc.Graph(id="profiles-graph", config=graph_config, style={"height": "26vh", "minHeight": "240px"})]),
+                                                html.Div(style=panel_style, children=[html.Div("Корреляция рельефа", style=panel_title_style), dcc.Graph(id="correlation-heatmap", config=graph_config, style={"height": "26vh", "minHeight": "240px"})]),
+                                            ],
+                                        ),
+                                        html.Div(
+                                            style={"display": "none"},
+                                            children=[
+                                                html.Div(
+                                                    style={**panel_style, "padding": "12px"},
+                                                    children=[
+                                                        html.Div("Временная шкала режимов", style={**panel_title_style, "padding": "0 0 10px 0"}),
+                                                        html.Div(
+                                                            style={"height": "32px", "display": "grid", "gridTemplateColumns": "1.2fr 0.95fr 2.0fr 0.75fr 1.1fr", "borderRadius": "6px", "overflow": "hidden", "border": "1px solid rgba(70, 130, 170, 0.44)"},
+                                                            children=[
+                                                                html.Div("GNSS ON", style={"background": "#17682f", "display": "grid", "placeItems": "center", "fontWeight": "800", "fontSize": "11px"}),
+                                                                html.Div("GNSS LOST", style={"background": "#8d1f2d", "display": "grid", "placeItems": "center", "fontWeight": "800", "fontSize": "11px"}),
+                                                                html.Div("TERRAIN_NAV", style={"background": "#0b54c7", "display": "grid", "placeItems": "center", "fontWeight": "800", "fontSize": "11px"}),
+                                                                html.Div("ПАУЗА", style={"background": "#535b66", "display": "grid", "placeItems": "center", "fontWeight": "800", "fontSize": "11px"}),
+                                                                html.Div("GNSS ON", style={"background": "#17682f", "display": "grid", "placeItems": "center", "fontWeight": "800", "fontSize": "11px"}),
+                                                            ],
+                                                        ),
+                                                        html.Div(style={"display": "grid", "gridTemplateColumns": "repeat(5, 1fr)", "gap": "6px", "marginTop": "12px", "color": "#9fc4dc", "fontSize": "12px"}, children=[html.Div("00:00 старт"), html.Div("GNSS loss"), html.Div("terrain nav"), html.Div("reacquire"), html.Div("финиш")]),
+                                                    ],
+                                                ),
+                                                html.Div(
+                                                    style={**panel_style, "padding": "0"},
+                                                    children=[
+                                                        html.Div("Журнал событий", style={**panel_title_style, "padding": "10px 12px"}),
+                                                        html.Div(style=event_header_style, children=[html.Div("Время"), html.Div("Уровень"), html.Div("Событие"), html.Div("Детали")]),
+                                                        html.Div(
+                                                            style={"maxHeight": "176px", "overflowY": "auto"},
+                                                            children=[
+                                                                event_row("00:03:48", "WARN", "#9e6a12", "Потеря сигнала GNSS", "SNR ниже порога, спутников: 2/12"),
+                                                                event_row("00:04:08", "INFO", "#0f65b8", "Начало поиска рельефа", "Переключение на TERRAIN_NAV через 60 с"),
+                                                                event_row("00:07:42", "INFO", "#0f65b8", "Переход в TERRAIN_NAV", "Режим навигации по рельефу активирован"),
+                                                                event_row("00:07:42", "INFO", "#1c8d49", "Обновление позиции", "NCC=0.82, азимут=129.3°, смещение=+6.2 м"),
+                                                                event_row("00:07:42", "DEBUG", "#34506a", "Метрики обновлены", "Ошибка 3D=18.6 м, ошибка 2D=14.2 м"),
+                                                            ],
+                                                        ),
+                                                        dcc.Graph(id="telemetry-graph", config=graph_config, style={"display": "none"}),
                                                     ],
                                                 ),
                                             ],
                                         ),
                                     ],
                                 ),
-                                html.Div(id="signal-quality-panel", style={"display": "grid", "gap": "8px"}),
-                            ],
-                        ),
-                    ],
-                ),
+                                html.Div(
+                                    id="profile-section",
+                                    style=section_hidden_style,
+                                    children=[
+                                        html.Div(
+                                            style={"width": "100%", "paddingTop": "4px"},
+                                            children=[
+                                                html.Div("Экран 2. Анализ профиля высоты и качества сигналов", style={"fontSize": "15px", "fontWeight": "900", "letterSpacing": "0.05em", "textTransform": "uppercase", "color": "#eaf6ff", "marginBottom": "12px"}),
+                                                html.Div(
+                                                    style={"display": "grid", "gridTemplateColumns": "minmax(720px, 1fr) 320px", "gap": "12px", "alignItems": "stretch"},
+                                                    children=[
+                                                        html.Div(
+                                                            style={"display": "grid", "gridTemplateRows": "1fr 0.8fr 1fr", "gap": "12px"},
+                                                            children=[
+                                                                html.Div(style=panel_style, children=[html.Div("1. Профиль высоты", style=panel_title_style), dcc.Graph(id="altitude-profile-screen", config=graph_config, style={"height": "28vh", "minHeight": "245px"})]),
+                                                                html.Div(style=panel_style, children=[html.Div("2. Скорость и курс", style=panel_title_style), dcc.Graph(id="speed-heading-screen", config=graph_config, style={"height": "21vh", "minHeight": "190px"})]),
+                                                                html.Div(style=panel_style, children=[html.Div("3. Сигналы датчиков", style=panel_title_style), dcc.Graph(id="sensor-signals-screen", config=graph_config, style={"height": "25vh", "minHeight": "225px"})]),
+                                                            ],
+                                                        ),
+                                                        html.Div(id="profile-stats-panel", style={"display": "grid", "gap": "12px"}),
+                                                    ],
+                                                ),
+                                                html.Div(
+                                                    style={"display": "grid", "gridTemplateColumns": "1fr 320px", "gap": "12px", "marginTop": "12px"},
+                                                    children=[
+                                                        html.Div(
+                                                            style={**panel_style, "padding": "14px"},
+                                                            children=[
+                                                                html.Div("Формула восстановления профиля рельефа", style={**panel_title_style, "padding": "0 0 10px 0"}),
+                                                                html.Div(
+                                                                    style={"display": "grid", "gridTemplateColumns": "360px 1fr 1fr", "gap": "18px", "alignItems": "center"},
+                                                                    children=[
+                                                                        html.Div("terrain_profile = baro_alt_m - radar_alt_m", style={"border": "1px solid rgba(81, 130, 161, 0.7)", "borderRadius": "8px", "padding": "16px", "fontSize": "18px", "fontFamily": "Consolas, monospace", "background": "rgba(8, 22, 34, 0.95)", "color": "#ffffff"}),
+                                                                        html.Div(children=[html.Div("terrain_profile", style={"color": "#7CFF8A", "fontFamily": "Consolas, monospace", "fontWeight": "900"}), html.Div("восстановленный профиль рельефа, м", style={"color": "#9fbdd4", "fontSize": "12px"}), html.Div("baro_alt_m", style={"color": "#caff73", "fontFamily": "Consolas, monospace", "fontWeight": "900", "marginTop": "8px"}), html.Div("барометрическая высота, м", style={"color": "#9fbdd4", "fontSize": "12px"})]),
+                                                                        html.Div(children=[html.Div("radar_alt_m", style={"color": "#57d6ff", "fontFamily": "Consolas, monospace", "fontWeight": "900"}), html.Div("высота по радиовысотомеру AGL, м", style={"color": "#9fbdd4", "fontSize": "12px"}), html.Div("Все высоты приведены в метрах.", style={"color": "#cfe7fa", "fontSize": "12px", "marginTop": "10px"})]),
+                                                                    ],
+                                                                ),
+                                                            ],
+                                                        ),
+                                                        html.Div(id="signal-quality-panel", style={"display": "grid", "gap": "12px"}),
+                                                    ],
+                                                ),
+                                            ],
+                                        ),
+                                    ],
+                                ),
                             ],
                         ),
                     ],
@@ -723,8 +771,17 @@ class TerrainNavigatorDash:
             Input("app-sections", "value"),
         )
         def _section_switch_callback(section: str) -> tuple[dict[str, str], dict[str, str]]:
-            visible = {"display": "block"}
-            hidden = {"display": "none"}
+            visible = {"position": "relative", "width": "100%", "display": "block"}
+            hidden = {
+                "position": "absolute",
+                "left": "-200vw",
+                "top": "0",
+                "width": "100%",
+                "height": "0",
+                "overflow": "hidden",
+                "opacity": "0",
+                "pointerEvents": "none",
+            }
             if section == "profile":
                 return hidden, visible
             return visible, hidden
@@ -741,16 +798,112 @@ class TerrainNavigatorDash:
             return self.handle_control_button_click()
 
         @self.app.callback(
+            Output("checkpoint-upload-filenames", "children"),
+            Input("checkpoint-heights-upload", "filename"),
+            Input("checkpoint-dem-upload", "filename"),
+        )
+        def _checkpoint_file_labels(heights_filename: str | None, dem_filename: str | None) -> str:
+            heights_label = heights_filename or "не выбран"
+            dem_label = dem_filename or "не выбран"
+            return f"Файл высот: {heights_label}\nDEM: {dem_label}"
+
+        @self.app.callback(
+            Output("checkpoint-status", "children"),
+            Output("checkpoint-upload-store", "data"),
+            Input("checkpoint-load-button", "n_clicks"),
+            State("checkpoint-heights-upload", "contents"),
+            State("checkpoint-heights-upload", "filename"),
+            State("checkpoint-dem-upload", "contents"),
+            State("checkpoint-dem-upload", "filename"),
+            State("checkpoint-start-x", "value"),
+            State("checkpoint-start-y", "value"),
+            State("checkpoint-heading", "value"),
+            State("checkpoint-speed", "value"),
+            State("checkpoint-freq", "value"),
+            State("checkpoint-xy-mode", "value"),
+            prevent_initial_call=True,
+        )
+        def _checkpoint_load_callback(
+            n_clicks: int,
+            heights_contents: str | None,
+            heights_filename: str | None,
+            dem_contents: str | None,
+            dem_filename: str | None,
+            start_x: float | None,
+            start_y: float | None,
+            heading: float | None,
+            speed: float | None,
+            freq: float | None,
+            xy_mode: str | None,
+        ) -> tuple[str, dict[str, Any]]:
+            del n_clicks
+            missing: list[str] = []
+            if not heights_contents:
+                missing.append("файл высот")
+            if not dem_contents:
+                missing.append("DEM GeoTIFF")
+            if start_x is None:
+                missing.append("start x")
+            if start_y is None:
+                missing.append("start y")
+            if heading is None:
+                missing.append("heading")
+            if speed is None:
+                missing.append("speed")
+            if freq is None:
+                missing.append("freq")
+            if missing:
+                return f"Не хватает входов по кейсу: {', '.join(missing)}", no_update
+
+            try:
+                upload_dir = CHECKPOINT_UPLOAD_DIR
+                upload_dir.mkdir(parents=True, exist_ok=True)
+                heights_path = _store_uploaded_file(heights_contents, heights_filename, upload_dir, "heights.txt")
+                dem_path = _store_uploaded_file(dem_contents, dem_filename, upload_dir, "dem.tif")
+                manifest = {
+                    "heights": str(heights_path),
+                    "dem": str(dem_path),
+                    "start_x": float(start_x),
+                    "start_y": float(start_y),
+                    "heading": float(heading),
+                    "speed": float(speed),
+                    "freq": float(freq),
+                    "xy_mode": str(xy_mode or "auto"),
+                }
+                (upload_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+                command = (
+                    f'python .\\checkpoint_runner.py --dem "{dem_path}" --heights "{heights_path}" --input-kind radar '
+                    f'--start-x {float(start_x)} --start-y {float(start_y)} --xy-mode {str(xy_mode or "auto")} '
+                    f'--heading {float(heading)} --speed {float(speed)} --freq {float(freq)} --dashboard --open-browser'
+                )
+                run_script = f'Set-Location "{Path.cwd()}"\r\n{command}\r\n'
+                (upload_dir / "run_checkpoint.ps1").write_text(run_script, encoding="utf-8")
+                status = (
+                    "Набор по кейсу сохранен.\n"
+                    f"heights: {heights_path.name}\n"
+                    f"dem: {dem_path.name}\n"
+                    f"xy-mode: {str(xy_mode or 'auto')}\n"
+                    "Готовый запуск:\n"
+                    f"{command}"
+                )
+                return status, manifest
+            except Exception as exc:
+                LOGGER.exception("Failed to save checkpoint upload set")
+                return f"Ошибка загрузки набора: {exc}", no_update
+
+        @self.app.callback(
             Output("correlation-heatmap", "figure"),
             Output("terrain-map", "figure"),
             Output("profiles-graph", "figure"),
             Output("telemetry-graph", "figure"),
             Output("metrics-panel", "children"),
             Output("history-store", "data"),
+            Input("app-sections", "value"),
             Input("dashboard-interval", "n_intervals"),
             State("history-store", "data"),
         )
-        def _callback(n_intervals: int, data_store: dict[str, Any]) -> tuple[Any, Any, Any, Any, Any, Any]:
+        def _callback(section: str, n_intervals: int, data_store: dict[str, Any]) -> tuple[Any, Any, Any, Any, Any, Any]:
+            del section
             return self.update_all_panels(n_intervals, data_store)
 
         @self.app.callback(
@@ -759,10 +912,12 @@ class TerrainNavigatorDash:
             Output("sensor-signals-screen", "figure"),
             Output("profile-stats-panel", "children"),
             Output("signal-quality-panel", "children"),
+            Input("app-sections", "value"),
             Input("dashboard-interval", "n_intervals"),
             State("history-store", "data"),
         )
-        def _profile_screen_callback(n_intervals: int, data_store: dict[str, Any]) -> tuple[Any, Any, Any, Any, Any]:
+        def _profile_screen_callback(section: str, n_intervals: int, data_store: dict[str, Any]) -> tuple[Any, Any, Any, Any, Any]:
+            del section
             return self.update_profile_screen(n_intervals, data_store)
 
     def update_profile_screen(
@@ -778,6 +933,13 @@ class TerrainNavigatorDash:
             latest = data_store.get("latest_state")
             if isinstance(latest, dict):
                 state = latest
+
+        if isinstance(state, dict) and bool(state.get("dashboard_idle")):
+            self._latest_runtime_state = None
+            idle_store = {"history": []}
+            idle_message = str(state.get("idle_message", "Сначала загрузите данные по кейсу и запустите маршрут."))
+            waiting_figure = _build_status_figure("Ожидание запуска", idle_message)
+            return waiting_figure, waiting_figure, waiting_figure, waiting_figure, [], idle_store
 
         if state is None:
             empty = self._empty_screen_figure("Ожидание данных")
@@ -1092,12 +1254,12 @@ class TerrainNavigatorDash:
             pipeline_emitted_monotonic_s = float(state.get("pipeline_emitted_monotonic_s", now_monotonic_s))
             state["dashboard_latency_ms"] = max((now_monotonic_s - pipeline_emitted_monotonic_s) * 1000.0, 0.0)
             state["reaction_latency_ms"] = max((now_monotonic_s - event_ingest_monotonic_s) * 1000.0, 0.0)
-        store["history"] = history[-500:]
+        store["history"] = list(history)
         store["latest_state"] = self._summarize_state_for_store(state)
 
         try:
             heatmap_figure = self._build_correlation_figure(state["corr"])
-            terrain_map_figure = self._build_map_figure(state, store["history"])
+            terrain_map_figure = self._build_map_figure(state, history)
             profiles_figure = self._build_profiles_figure(state)
             telemetry_figure = self._build_telemetry_figure(state)
         except Exception:
@@ -1163,6 +1325,7 @@ class TerrainNavigatorDash:
         figure = go.Figure()
         if patch.size > 0 and transform is not None:
             x_coords, y_coords = self._build_patch_axes(patch, transform)
+            patch, x_coords, y_coords = self._downsample_patch_for_dashboard(patch, x_coords, y_coords)
         else:
             x_coords = None
             y_coords = None
@@ -1289,11 +1452,36 @@ class TerrainNavigatorDash:
         )
         map_lon_span = 0.02
         map_lat_span = 0.02
+        lon_values: list[float] = []
+        lat_values: list[float] = []
+        if x_coords is not None and len(x_coords) >= 2:
+            lon_values.extend([float(x_coords[0]), float(x_coords[-1])])
+        if y_coords is not None and len(y_coords) >= 2:
+            lat_values.extend([float(y_coords[0]), float(y_coords[-1])])
+        if history:
+            lon_values.extend(float(entry["lon"]) for entry in history)
+            lat_values.extend(float(entry["lat"]) for entry in history)
+        lon_values.append(float(fix.lon))
+        lat_values.append(float(fix.lat))
+        if truth is not None:
+            lon_values.append(float(truth["lon"]))
+            lat_values.append(float(truth["lat"]))
         if x_coords is not None and len(x_coords) >= 2:
             map_lon_span = max(abs(float(x_coords[-1]) - float(x_coords[0])), 1e-4)
         if y_coords is not None and len(y_coords) >= 2:
             map_lat_span = max(abs(float(y_coords[-1]) - float(y_coords[0])), 1e-4)
+        if lon_values:
+            map_lon_span = max(max(lon_values) - min(lon_values), map_lon_span, 1e-4)
+        if lat_values:
+            map_lat_span = max(max(lat_values) - min(lat_values), map_lat_span, 1e-4)
         arrow_length_deg = max(min(max(map_lon_span, map_lat_span) * 0.12, 0.02), 0.0025)
+        lon_padding = max(map_lon_span * 0.12, 0.002)
+        lat_padding = max(map_lat_span * 0.12, 0.002)
+        xaxis_range = None
+        yaxis_range = None
+        if lon_values and lat_values:
+            xaxis_range = [min(lon_values) - lon_padding, max(lon_values) + lon_padding]
+            yaxis_range = [min(lat_values) - lat_padding, max(lat_values) + lat_padding]
         figure.update_layout(
             template="plotly_dark",
             title="Карта рельефа и траектория",
@@ -1326,10 +1514,31 @@ class TerrainNavigatorDash:
         figure.update_layout(
             dragmode="zoom",
             uirevision="terrain-map-zoom",
-            xaxis={"fixedrange": False, "gridcolor": "rgba(255,255,255,0.12)", "zerolinecolor": "rgba(255,255,255,0.18)"},
-            yaxis={"fixedrange": False, "scaleanchor": "x", "scaleratio": 1, "gridcolor": "rgba(255,255,255,0.12)", "zerolinecolor": "rgba(255,255,255,0.18)"},
+            autosize=True,
+            xaxis={"fixedrange": False, "gridcolor": "rgba(255,255,255,0.12)", "zerolinecolor": "rgba(255,255,255,0.18)", "range": xaxis_range},
+            yaxis={"fixedrange": False, "gridcolor": "rgba(255,255,255,0.12)", "zerolinecolor": "rgba(255,255,255,0.18)", "range": yaxis_range},
         )
         return figure
+
+    def _downsample_patch_for_dashboard(
+        self,
+        patch: np.ndarray,
+        x_coords: np.ndarray | None,
+        y_coords: np.ndarray | None,
+        max_dim: int = 96,
+    ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+        """Reduce DEM patch resolution so Dash can keep real-time updates responsive."""
+
+        if patch.ndim != 2 or patch.size == 0:
+            return patch, x_coords, y_coords
+        rows, cols = patch.shape
+        stride = max(int(math.ceil(max(rows, cols) / max_dim)), 1)
+        if stride <= 1:
+            return patch, x_coords, y_coords
+        patch_small = patch[::stride, ::stride]
+        x_small = x_coords[::stride] if x_coords is not None else None
+        y_small = y_coords[::stride] if y_coords is not None else None
+        return patch_small, x_small, y_small
 
     def _parse_dem_patch_transform(self, raw_transform: Any) -> tuple[float, float, float, float, float, float] | None:
         """Parse a serialized affine tuple for DEM patch plotting."""
@@ -1619,32 +1828,17 @@ class TerrainNavigatorDash:
         metric_items = [
             ("Источник позиции", fix_source),
             ("Режим навигации", nav_mode),
+            ("Состояние GNSS", "ВКЛ" if gnss_available else "ВЫКЛ"),
+            ("Целостность", integrity_status),
             ("Корреляция надежна", correlation_status),
             ("Есть неоднозначность", ambiguity_status),
             ("Пик корреляции", f"{peak_correlation:.3f}"),
-            ("Уверенность", f"{confidence:.3f}"),
-            ("Лучший азимут", f"{best_azimuth_deg:.1f}°"),
-            ("Лучшее смещение", f"{best_offset_m:.1f} м"),
-            ("Субпиксельное смещение", f"{best_offset_subsample_m:.1f} м"),
-            ("Скорость", f"{speed_mps:.2f} м/с"),
-            ("Задержка реакции", _format_metric_value(reaction_latency_ms, "мс")),
-            ("Цель по задержке", "< 200 мс" if latency_target_ok else "БОЛЬШЕ 200 мс"),
-            ("Задержка пайплайна", _format_metric_value(pipeline_latency_ms, "мс")),
-            ("Задержка дашборда", _format_metric_value(dashboard_latency_ms, "мс")),
-            ("Очередь replay", _format_metric_value(queue_latency_ms, "мс")),
             ("PSLR", f"{pslr_db:.2f} dB"),
-            ("Число пиков", str(ambiguity_peak_count)),
-            ("CRLB", _format_metric_value(observability.get("crlb_m"), "м")),
-            ("Энергия градиента", _format_metric_value(observability.get("gradient_energy"), "")),
-            ("Подсказка наблюдаемости", _format_metric_value(observability.get("efficiency_hint"), "")),
-            ("Смещение рельефа", _format_metric_value(state.get("terrain_bias_m"), "м")),
-            ("RMSE остатка", _format_metric_value(residual_rmse, "м")),
+            ("Лучший азимут", f"{best_azimuth_deg:.1f}°"),
+            ("Скорость", f"{speed_mps:.2f} м/с"),
             ("Ошибка трека", _format_metric_value(track_error_m, "м")),
-            ("Целостность", integrity_status),
-            ("Потеряно кадров", str(frame_drop_count)),
-            ("Замены состояний", str(state_queue_replacements)),
-            ("Размер окна", f"{int(state.get('selected_window_size', 0))} кадров"),
-            ("Состояние GNSS", "ВКЛ" if gnss_available else "ВЫКЛ"),
+            ("CRLB", _format_metric_value(observability.get("crlb_m"), "м")),
+            ("Задержка реакции", _format_metric_value(reaction_latency_ms, "мс")),
         ]
         return [self._metric_card(label, value) for label, value in metric_items]
 
@@ -1692,7 +1886,7 @@ class TerrainNavigatorDash:
             "runtime_stats": dict(state.get("runtime_stats", {})),
             "truth": truth,
             "dem_patch_transform": state.get("dem_patch_transform"),
-            "route_history": list(state.get("route_history", []))[-500:] if isinstance(state.get("route_history"), list) else [],
+            "route_history": list(state.get("route_history", [])) if isinstance(state.get("route_history"), list) else [],
             "h_meas": h_meas.tolist(),
             "ref": best_ref.tolist(),
         }
