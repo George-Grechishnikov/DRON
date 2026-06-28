@@ -16,6 +16,14 @@ from measurement_layer import BaroTrack, frames_to_terrain_profile
 from nmea_parser import NMEAFrame
 from profile_extractor import extract_terrain_features, normalize_profile
 
+try:
+    from correlation_fallback import compute_hybrid_heatmaps, cpp_backend_available
+except ImportError:  # pragma: no cover - optional acceleration module
+    compute_hybrid_heatmaps = None
+
+    def cpp_backend_available() -> bool:
+        return False
+
 
 LOGGER = logging.getLogger(__name__)
 PSR_THRESHOLD = 1.3
@@ -224,21 +232,32 @@ class Correlator:
         meas_feature = extract_terrain_features(h_meas_array, step_m=self.step_m) if self.use_terrain_features else None
         h_centered = h_meas_array - h_mean
 
-        for row_index, ref_profile in enumerate(ref_array):
-            ref_values = np.asarray(ref_profile, dtype=float)
-            combined_values, ncc_values, msd_values, valid_fraction_values = self._compute_row_correlation(
-                h_meas_array=h_meas_array,
-                h_centered=h_centered,
-                h_std=h_std,
-                ref_values=ref_values,
-                usable_offsets=usable_offsets,
-                window_length=window_length,
-                meas_feature=meas_feature,
-            )
-            heatmap[row_index, :] = combined_values
-            ncc_heatmap[row_index, :] = ncc_values
-            msd_heatmap[row_index, :] = msd_values
-            valid_fraction_heatmap[row_index, :] = valid_fraction_values
+        native_heatmaps = self._try_native_heatmaps(
+            h_meas_array=h_meas_array,
+            ref_array=ref_array,
+            usable_offsets=usable_offsets,
+        )
+        if native_heatmaps is not None:
+            heatmap[:, :] = native_heatmaps[0]
+            ncc_heatmap[:, :] = native_heatmaps[1]
+            msd_heatmap[:, :] = native_heatmaps[2]
+            valid_fraction_heatmap[:, :] = 1.0
+        else:
+            for row_index, ref_profile in enumerate(ref_array):
+                ref_values = np.asarray(ref_profile, dtype=float)
+                combined_values, ncc_values, msd_values, valid_fraction_values = self._compute_row_correlation(
+                    h_meas_array=h_meas_array,
+                    h_centered=h_centered,
+                    h_std=h_std,
+                    ref_values=ref_values,
+                    usable_offsets=usable_offsets,
+                    window_length=window_length,
+                    meas_feature=meas_feature,
+                )
+                heatmap[row_index, :] = combined_values
+                ncc_heatmap[row_index, :] = ncc_values
+                msd_heatmap[row_index, :] = msd_values
+                valid_fraction_heatmap[row_index, :] = valid_fraction_values
 
         invalid_mask = valid_fraction_heatmap < self.min_valid_fraction
         heatmap[invalid_mask] = -np.inf
@@ -467,6 +486,41 @@ class Correlator:
         zeros = np.zeros((usable_offsets,), dtype=float)
         valid_fractions = np.ones((usable_offsets,), dtype=float)
         return corr_values, zeros.copy(), zeros, valid_fractions
+
+    def _try_native_heatmaps(
+        self,
+        *,
+        h_meas_array: np.ndarray,
+        ref_array: np.ndarray,
+        usable_offsets: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        """Use the optional C++ backend for finite height-profile heatmaps."""
+
+        if compute_hybrid_heatmaps is None or self.use_terrain_features or self.feature_refine_top_k > 0:
+            return None
+        if not cpp_backend_available():
+            return None
+        if not (np.all(np.isfinite(h_meas_array)) and np.all(np.isfinite(ref_array))):
+            return None
+
+        native_result = compute_hybrid_heatmaps(
+            h_meas_array,
+            ref_array,
+            usable_offsets=usable_offsets,
+            metric=self.metric,
+            alpha=self.alpha,
+            beta=self.beta,
+            msd_scale_m2=self.msd_scale_m2,
+        )
+        if native_result is None:
+            return None
+
+        heatmap, ncc_heatmap, msd_heatmap = native_result
+        expected_shape = (ref_array.shape[0], usable_offsets)
+        if heatmap.shape != expected_shape or ncc_heatmap.shape != expected_shape or msd_heatmap.shape != expected_shape:
+            LOGGER.warning("C++ correlation backend returned unexpected shape; falling back to Python")
+            return None
+        return heatmap, ncc_heatmap, msd_heatmap
 
     def _refine_top_k_candidates(
         self,
@@ -735,7 +789,10 @@ class Correlator:
         exclusion[np.ix_(excluded_rows, np.arange(col_start, col_stop, dtype=int))] = True
         sidelobes = sanitized[finite_mask & ~exclusion]
         sidelobe = float(np.nanmax(sidelobes)) if sidelobes.size else 1e-10
-        pslr_db = 20.0 * math.log10((peak_val + 1e-10) / (abs(sidelobe) + 1e-10))
+        if peak_val <= 0.0:
+            pslr_db = 0.0
+        else:
+            pslr_db = 20.0 * math.log10(max(peak_val, 1e-10) / max(abs(sidelobe), 1e-10))
 
         other_mask = ~((candidate_rows == peak_row) & (candidate_cols == peak_col))
         if not np.any(other_mask):

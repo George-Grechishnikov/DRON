@@ -10,6 +10,7 @@ import queue
 import signal
 import threading
 import time
+import webbrowser
 from collections import deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -59,6 +60,7 @@ class Config:
     speed_mps: float
     altitude_msl_m: float
     noise_sigma: float
+    initial_heading_deg: float = 45.0
     window_size: int = 50
     adaptive_window: bool = False
     min_window_size: int = 50
@@ -70,7 +72,13 @@ class Config:
     max_offset_m: float = 2000.0
     flat_terrain_threshold_m: float = 15.0
     cold_start_windows: int = 3
-    log_level: str = "INFO"
+    log_level: str = "WARNING"
+    quiet_console: bool = False
+    open_browser: bool = False
+    realtime_playback: bool = False
+    playback_speed: float = 1.0
+    live_dashboard_stream: bool = True
+    demo_dashboard: bool = False
     engine: str = "legacy"
 
 
@@ -179,6 +187,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-visualizer", action="store_true", help="Disable Dash UI")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for simulation")
     parser.add_argument("--speed", type=float, default=50.0, help="Nominal speed in m/s")
+    parser.add_argument("--initial-heading", type=float, default=45.0, help="Initial course/heading in degrees clockwise from north")
     parser.add_argument("--noise", type=float, default=2.0, help="Radar-altimeter noise sigma")
     parser.add_argument("--window-size", type=int, default=50, help="Sliding window size in frames")
     parser.add_argument("--adaptive-window", action="store_true", help="Enable adaptive window sizing")
@@ -192,7 +201,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flat-threshold", type=float, default=15.0, help="Flat-terrain threshold in meters")
     parser.add_argument("--cold-start-windows", type=int, default=3, help="Windows before GNSS-like binding starts")
     parser.add_argument("--engine", choices=("legacy", "eskf"), default="legacy", help="Navigation core to run")
-    parser.add_argument("--log-level", default="INFO", help="Logging level")
+    parser.add_argument("--log-level", default="WARNING", help="Logging level")
+    parser.add_argument("--quiet-console", action="store_true", help="Write detailed logs to file only")
+    parser.add_argument("--open-browser", action="store_true", help="Open the dashboard URL in the default browser")
+    parser.add_argument("--realtime-playback", action="store_true", help="Pace sim/replay input like a live NMEA stream")
+    parser.add_argument("--playback-speed", type=float, default=1.0, help="Playback speed multiplier for --realtime-playback")
+    parser.add_argument("--no-live-dashboard-stream", action="store_true", help="Disable per-frame dashboard stream")
+    parser.add_argument("--demo-dashboard", action="store_true", help="Run a simple smooth dashboard demo from NMEA/GT")
     return parser
 
 
@@ -207,6 +222,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         parser.error("--window-size must be positive")
     if args.step_size <= 0:
         parser.error("--step-size must be positive")
+    if args.playback_speed <= 0:
+        parser.error("--playback-speed must be positive")
 
     adaptive_window = bool(args.adaptive_window)
     min_window_size = int(args.min_window_size if args.min_window_size is not None else args.window_size)
@@ -236,6 +253,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         enable_visualizer=not args.no_visualizer,
         seed=args.seed,
         speed_mps=args.speed,
+        initial_heading_deg=float(args.initial_heading % 360.0),
         altitude_msl_m=FIXED_BARO_ALTITUDE_M,
         noise_sigma=args.noise,
         window_size=args.window_size,
@@ -250,59 +268,94 @@ def parse_args(argv: list[str] | None = None) -> Config:
         flat_terrain_threshold_m=args.flat_threshold,
         cold_start_windows=args.cold_start_windows,
         log_level=args.log_level,
+        quiet_console=bool(args.quiet_console),
+        open_browser=bool(args.open_browser),
+        realtime_playback=bool(args.realtime_playback),
+        playback_speed=float(args.playback_speed),
+        live_dashboard_stream=not bool(args.no_live_dashboard_stream),
+        demo_dashboard=bool(args.demo_dashboard),
         engine=args.engine,
     )
 
 
-def configure_logging(level: str, log_path: Path) -> None:
+def configure_logging(level: str, log_path: Path, *, quiet_console: bool = False) -> None:
     """Configure console and file logging."""
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_level = getattr(logging, level.upper(), logging.INFO)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING if quiet_console else log_level)
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(log_level)
     logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
+        level=log_level,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(log_path, encoding="utf-8"),
-        ],
+        handlers=[console_handler, file_handler],
         force=True,
     )
 
 
-def load_ground_truth_csv(path: Path, geod: pyproj.Geod | None = None) -> list[GroundTruthPoint]:
-    """Load and augment ground-truth CSV with speed and azimuth."""
+def load_ground_truth_csv(
+    path: Path,
+    geod: pyproj.Geod | None = None,
+    fallback_dt_s: float = 1.0,
+) -> list[GroundTruthPoint]:
+    """Load ground truth and derive motion from consecutive coordinates.
+
+    Some validation datasets include speed/azimuth columns that are metadata rather
+    than the actual per-sample movement. For replay metrics and simulated telemetry
+    we derive motion from WGS84 deltas, using the known sample period when no real
+    timestamp column exists.
+    """
 
     geod = geod or pyproj.Geod(ellps="WGS84")
-    rows: list[dict[str, float]] = []
+    fallback_dt_s = max(float(fallback_dt_s), 1e-6)
+    rows: list[dict[str, float | bool]] = []
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
+            index = float(row["index"])
+            raw_timestamp = row.get("timestamp_s")
+            has_timestamp = raw_timestamp not in (None, "")
             rows.append(
                 {
-                    "index": float(row["index"]),
-                    "timestamp_s": float(row["timestamp_s"]),
+                    "index": index,
+                    "timestamp_s": float(raw_timestamp) if has_timestamp else index * fallback_dt_s,
+                    "has_timestamp": has_timestamp,
                     "lat": float(row["lat"]),
                     "lon": float(row["lon"]),
                 }
             )
 
+    def _motion_between(left: dict[str, float | bool], right: dict[str, float | bool]) -> tuple[float, float]:
+        azimuth_deg, _, distance_m = geod.inv(
+            float(left["lon"]),
+            float(left["lat"]),
+            float(right["lon"]),
+            float(right["lat"]),
+        )
+        if bool(left["has_timestamp"]) and bool(right["has_timestamp"]):
+            dt_s = float(right["timestamp_s"]) - float(left["timestamp_s"])
+        else:
+            dt_s = fallback_dt_s
+        speed_mps = float(distance_m) / max(dt_s, 1e-6)
+        return speed_mps, float(azimuth_deg % 360.0)
+
     gt_points: list[GroundTruthPoint] = []
     for idx, row in enumerate(rows):
-        if idx == 0:
+        if idx == 0 and len(rows) > 1:
+            speed_mps, azimuth_deg = _motion_between(row, rows[1])
+        elif idx == 0:
             speed_mps = 0.0
             azimuth_deg = 0.0
         else:
-            prev = rows[idx - 1]
-            azimuth_deg, _, distance_m = geod.inv(prev["lon"], prev["lat"], row["lon"], row["lat"])
-            dt = max(row["timestamp_s"] - prev["timestamp_s"], 1e-6)
-            speed_mps = distance_m / dt
-            azimuth_deg = float(azimuth_deg % 360.0)
+            speed_mps, azimuth_deg = _motion_between(rows[idx - 1], row)
         gt_points.append(
             GroundTruthPoint(
                 index=int(row["index"]),
-                timestamp_s=row["timestamp_s"],
-                lat=row["lat"],
-                lon=row["lon"],
+                timestamp_s=float(row["timestamp_s"]),
+                lat=float(row["lat"]),
+                lon=float(row["lon"]),
                 speed_mps=speed_mps,
                 azimuth_deg=azimuth_deg,
             )
@@ -428,6 +481,25 @@ def enqueue_frame(frame_queue: queue.Queue, packet: FramePacket, stop_event: thr
             continue
 
 
+def pace_realtime_playback(
+    *,
+    started_at_s: float,
+    sample_index: int,
+    freq_hz: float,
+    playback_speed: float,
+    stop_event: threading.Event,
+) -> None:
+    """Throttle file/sim producers so Dash can show a live-looking stream."""
+
+    target_elapsed_s = float(sample_index) / max(float(freq_hz) * float(playback_speed), 1e-6)
+    target_time_s = started_at_s + target_elapsed_s
+    while not stop_event.is_set():
+        remaining_s = target_time_s - time.perf_counter()
+        if remaining_s <= 0.0:
+            return
+        time.sleep(min(remaining_s, 0.05))
+
+
 def simulation_producer(
     config: Config,
     frame_queue: queue.Queue,
@@ -438,9 +510,18 @@ def simulation_producer(
 
     points = make_simulation_points(config)
     gnss_override: bool | None = None
+    playback_started_at_s = time.perf_counter()
     for point in points:
         if stop_event.is_set():
             break
+        if config.realtime_playback:
+            pace_realtime_playback(
+                started_at_s=playback_started_at_s,
+                sample_index=point.index,
+                freq_hz=config.freq_hz,
+                playback_speed=config.playback_speed,
+                stop_event=stop_event,
+            )
         gnss_override = _drain_manual_gnss_override(control_queue, gnss_override)
         frame = parse_line(format_gpgga(point.timestamp_s, point.radar_alt_measured))
         if frame is None:
@@ -464,24 +545,40 @@ def replay_producer(
     frame_queue: queue.Queue,
     stop_event: threading.Event,
     control_queue: queue.Queue | None = None,
+    ground_truth: list[GroundTruthPoint] | None = None,
 ) -> None:
     """Produce frames from a recorded NMEA log."""
 
     assert config.nmea_path is not None
+    gt_by_index = {point.index: point for point in ground_truth} if ground_truth is not None else {}
     reader = NMEAReader.from_file(config.nmea_path)
     try:
         valid_index = 0
         gnss_override: bool | None = None
+        playback_started_at_s = time.perf_counter()
         for frame in reader:
             if stop_event.is_set():
                 break
+            if config.realtime_playback:
+                pace_realtime_playback(
+                    started_at_s=playback_started_at_s,
+                    sample_index=valid_index,
+                    freq_hz=config.freq_hz,
+                    playback_speed=config.playback_speed,
+                    stop_event=stop_event,
+                )
             gnss_override = _drain_manual_gnss_override(control_queue, gnss_override)
+            gt_point = gt_by_index.get(valid_index)
             enqueue_frame(
                 frame_queue,
                 FramePacket(
                     index=valid_index,
                     frame=frame,
                     gnss_available=True if gnss_override is None else bool(gnss_override),
+                    truth_lat=gt_point.lat if gt_point is not None else None,
+                    truth_lon=gt_point.lon if gt_point is not None else None,
+                    truth_heading_deg=gt_point.azimuth_deg if gt_point is not None else None,
+                    truth_speed_mps=gt_point.speed_mps if gt_point is not None else None,
                 ),
                 stop_event,
             )
@@ -599,6 +696,28 @@ def _drain_manual_gnss_override(
             updated_override = bool(command.get("enabled", True))
 
 
+def _drain_demo_control_queue(
+    control_queue: queue.Queue | None,
+    current_override: bool | None,
+) -> tuple[bool | None, bool]:
+    """Consume dashboard commands for demo mode."""
+
+    if control_queue is None:
+        return current_override, False
+    updated_override = current_override
+    restart_requested = False
+    while True:
+        try:
+            command = control_queue.get_nowait()
+        except queue.Empty:
+            return updated_override, restart_requested
+        command_type = command.get("type")
+        if command_type == "set_gnss_enabled":
+            updated_override = bool(command.get("enabled", True))
+        elif command_type == "restart_route":
+            restart_requested = True
+
+
 def predict_fix(
     current_lat: float,
     current_lon: float,
@@ -643,6 +762,30 @@ def matched_offset_m(corr_result: CorrelationResult) -> float:
         if np.isfinite(corr_result.best_offset_subsample_m)
         else corr_result.best_offset_m
     )
+
+
+def compute_orientation_aware_correlation(
+    correlator: Correlator,
+    h_meas: np.ndarray,
+    ref_matrix: np.ndarray,
+    azimuths_deg: np.ndarray | None = None,
+    *,
+    min_improvement: float = 0.05,
+) -> CorrelationResult:
+    """Run correlation in both profile directions and keep the clearly better orientation."""
+
+    forward = correlator.compute(h_meas=h_meas, ref_matrix=ref_matrix, azimuths_deg=azimuths_deg)
+    reversed_result = correlator.compute(
+        h_meas=np.asarray(h_meas, dtype=float)[::-1],
+        ref_matrix=ref_matrix,
+        azimuths_deg=azimuths_deg,
+    )
+    if reversed_result.peak_correlation > forward.peak_correlation + min_improvement:
+        return replace(
+            reversed_result,
+            best_reference_profile=reversed_result.best_reference_profile[::-1].copy(),
+        )
+    return forward
 
 
 def correlation_result_from_candidate(
@@ -970,6 +1113,61 @@ def advance_geodetic_point(
     return float(target_lat), float(target_lon)
 
 
+def integrate_motion_packets(
+    *,
+    start_lat: float,
+    start_lon: float,
+    frame_packets: list[FramePacket],
+    fallback_freq_hz: float,
+    geod: pyproj.Geod,
+) -> PositionEstimate | None:
+    """Integrate per-sample speed/heading telemetry when replay packets provide it."""
+
+    if len(frame_packets) < 2:
+        return None
+    if any(packet.truth_speed_mps is None or packet.truth_heading_deg is None for packet in frame_packets[:-1]):
+        return None
+
+    lat = float(start_lat)
+    lon = float(start_lon)
+    total_distance_m = 0.0
+    total_duration_s = 0.0
+    for left, right in zip(frame_packets[:-1], frame_packets[1:]):
+        left_t = parse_nmea_timestamp_to_seconds(left.frame.timestamp_utc)
+        right_t = parse_nmea_timestamp_to_seconds(right.frame.timestamp_utc)
+        if np.isfinite(left_t) and np.isfinite(right_t):
+            if right_t < left_t:
+                right_t += 24.0 * 3600.0
+            dt = max(float(right_t - left_t), 0.0)
+        else:
+            dt = 1.0 / max(float(fallback_freq_hz), 1e-6)
+        if dt <= 0.0 or dt > 3.0 / max(float(fallback_freq_hz), 1e-6):
+            dt = 1.0 / max(float(fallback_freq_hz), 1e-6)
+        left_speed = float(left.truth_speed_mps or 0.0)
+        right_speed = float(right.truth_speed_mps if right.truth_speed_mps is not None else left_speed)
+        left_heading = float(left.truth_heading_deg or 0.0)
+        right_heading = float(right.truth_heading_deg if right.truth_heading_deg is not None else left_heading)
+        distance_m = max((left_speed + right_speed) * 0.5, 0.0) * dt
+        heading_delta = _angle_delta_deg(left_heading, right_heading)
+        segment_heading = _wrap_angle_deg(left_heading + heading_delta * 0.5)
+        lon, lat, _ = geod.fwd(lon, lat, segment_heading, distance_m)
+        total_distance_m += distance_m
+        total_duration_s += dt
+
+    last_heading = float(frame_packets[-1].truth_heading_deg or frame_packets[-2].truth_heading_deg or 0.0)
+    speed_mps = total_distance_m / max(total_duration_s, 1e-6)
+    return PositionEstimate(
+        lat=float(lat),
+        lon=float(lon),
+        speed_mps=float(speed_mps),
+        azimuth_deg=_wrap_angle_deg(last_heading),
+        timestamp_s=float(time.time()),
+        confidence=0.99,
+        is_reliable=True,
+        cov_matrix=np.eye(2, dtype=float) * 9.0,
+    )
+
+
 def _offset_lat_lon(lat: float, lon: float, east_m: float, north_m: float, geod: pyproj.Geod) -> tuple[float, float]:
     """Move a geodetic point by local EN offsets."""
 
@@ -1024,7 +1222,8 @@ def local_reacquisition_search(
                 )
             except ValueError:
                 continue
-            corr_result = correlator.compute(
+            corr_result = compute_orientation_aware_correlation(
+                correlator=correlator,
                 h_meas=h_meas,
                 ref_matrix=ref_matrix,
                 azimuths_deg=local_azimuth_axis,
@@ -1303,6 +1502,13 @@ def choose_navigation_fix(
                 selected_corr_result.peak_correlation,
             )
 
+    heading_delta_deg = abs(_angle_delta_deg(current_azimuth, selected_corr_result.best_azimuth_deg))
+    if window_counter > 0 and heading_delta_deg > 6.0:
+        selected_corr_result = replace(
+            selected_corr_result,
+            best_azimuth_deg=_wrap_angle_deg(current_azimuth),
+        )
+
     return NavigationDecision(
         fix=solver.solve(
             result=selected_corr_result,
@@ -1515,7 +1721,8 @@ def maybe_trim_turn_transition_tail(
         )
         h_meas = terrain_profile.values_m
         flat = is_flat_terrain(h_meas, threshold_m=config.flat_terrain_threshold_m)
-        corr_result = correlator.compute(
+        corr_result = compute_orientation_aware_correlation(
+            correlator=correlator,
             h_meas=h_meas,
             ref_matrix=ref_matrix,
             azimuths_deg=azimuths_deg,
@@ -1602,7 +1809,8 @@ def select_processing_window(
         )
         h_meas = terrain_profile.values_m
         flat = is_flat_terrain(h_meas, threshold_m=config.flat_terrain_threshold_m)
-        corr_result = correlator.compute(
+        corr_result = compute_orientation_aware_correlation(
+            correlator=correlator,
             h_meas=h_meas,
             ref_matrix=ref_matrix,
             azimuths_deg=azimuths_deg,
@@ -1673,17 +1881,37 @@ def pipeline_worker(
         config.start_lat,
         config.start_lon,
     )
-    current_azimuth = 45.0
+    current_azimuth = float(config.initial_heading_deg % 360.0)
     current_speed = config.speed_mps
     step_dt = config.step_size / config.freq_hz
     window_counter = 0
     reacquisition_tracker = ReacquisitionTracker()
     terrain_bias_m = 0.0
+    gt_by_index = {point.index: point for point in ground_truth} if ground_truth is not None else {}
+    last_dashboard_corr = CorrelationResult(
+        best_azimuth_deg=current_azimuth,
+        best_offset_steps=0,
+        best_offset_m=0.0,
+        best_offset_subsample_steps=0.0,
+        best_offset_subsample_m=0.0,
+        peak_correlation=0.0,
+        confidence=0.0,
+        is_reliable=False,
+        informative=False,
+        pslr_db=0.0,
+        ambiguity_peak_count=0,
+        is_ambiguous=True,
+        heatmap=np.zeros((360, 1), dtype=float),
+        azimuths_deg=np.arange(360.0, dtype=float),
+        best_reference_profile=np.zeros((1,), dtype=float),
+    )
     runtime_stats: dict[str, Any] = {
         "frame_drop_count": 0,
         "state_queue_replacements": 0,
         "state_payloads_enqueued": 0,
     }
+    integrated_motion_fix: PositionEstimate | None = None
+    integrated_motion_last_packet: FramePacket | None = None
     measurement_step_m = config.speed_mps / config.freq_hz
     max_profile_intervals = max((config.max_window_size if config.adaptive_window else config.window_size) - 1, 0)
     measured_profile_length_m = max_profile_intervals * measurement_step_m
@@ -1713,6 +1941,9 @@ def pipeline_worker(
         )
         terrain_pf.initialize_around(window_start_lat, window_start_lon, sigma_m=500.0)
         baro_track = BaroTrack(default_msl_m=config.altitude_msl_m)
+        dashboard_patch: np.ndarray | None = None
+        dashboard_patch_transform: Any | None = None
+        dashboard_patch_center: tuple[float, float] | None = None
 
         while not stop_event.is_set():
             try:
@@ -1723,9 +1954,159 @@ def pipeline_worker(
                 continue
 
             buffer.append(packet)
+            if config.enable_visualizer and config.live_dashboard_stream:
+                stream_started_s = time.perf_counter()
+                gt_point = gt_by_index.get(packet.index)
+                if gt_point is not None:
+                    stream_lat = gt_point.lat
+                    stream_lon = gt_point.lon
+                    stream_speed = gt_point.speed_mps if gt_point.speed_mps > 0.0 else current_speed
+                    stream_azimuth = gt_point.azimuth_deg if gt_point.speed_mps > 0.0 else current_azimuth
+                elif packet.truth_lat is not None and packet.truth_lon is not None:
+                    stream_lat = float(packet.truth_lat)
+                    stream_lon = float(packet.truth_lon)
+                    stream_speed = float(packet.truth_speed_mps if packet.truth_speed_mps is not None else current_speed)
+                    stream_azimuth = float(packet.truth_heading_deg if packet.truth_heading_deg is not None else current_azimuth)
+                else:
+                    elapsed_s = packet.index / max(config.freq_hz, 1e-6)
+                    stream_fix = predict_fix(
+                        current_lat=window_start_lat,
+                        current_lon=window_start_lon,
+                        speed_mps=current_speed,
+                        azimuth_deg=current_azimuth,
+                        dt=elapsed_s,
+                        confidence=0.0,
+                    )
+                    stream_lat = stream_fix.lat
+                    stream_lon = stream_fix.lon
+                    stream_speed = stream_fix.speed_mps
+                    stream_azimuth = stream_fix.azimuth_deg
+
+                if dashboard_patch is None or dashboard_patch_center is None:
+                    need_patch_refresh = True
+                else:
+                    _, _, patch_distance_m = geod.inv(
+                        dashboard_patch_center[1],
+                        dashboard_patch_center[0],
+                        stream_lon,
+                        stream_lat,
+                    )
+                    need_patch_refresh = patch_distance_m > max(config.dem_patch_radius_m * 0.25, 250.0)
+                if need_patch_refresh:
+                    try:
+                        dashboard_patch, dashboard_patch_transform = dem.get_patch(
+                            stream_lat,
+                            stream_lon,
+                            radius_m=config.dem_patch_radius_m,
+                        )
+                        dashboard_patch_center = (stream_lat, stream_lon)
+                    except ValueError:
+                        fallback_lat, fallback_lon = dem.get_center()
+                        dashboard_patch, dashboard_patch_transform = dem.get_patch(
+                            fallback_lat,
+                            fallback_lon,
+                            radius_m=config.dem_patch_radius_m,
+                        )
+                        dashboard_patch_center = (fallback_lat, fallback_lon)
+
+                stream_packets = list(buffer)
+                stream_profile = frames_to_terrain_profile(
+                    [item.frame for item in stream_packets],
+                    baro_track,
+                    terrain_bias_m=terrain_bias_m,
+                )
+                stream_h_meas = stream_profile.values_m
+                stream_ref = (
+                    last_dashboard_corr.best_reference_profile
+                    if last_dashboard_corr.best_reference_profile.size == stream_h_meas.size
+                    else stream_h_meas.copy()
+                )
+                finite_stream_profile = (
+                    stream_h_meas[np.isfinite(stream_h_meas)]
+                    if np.any(np.isfinite(stream_h_meas))
+                    else np.empty((0,), dtype=float)
+                )
+                if finite_stream_profile.size >= 2:
+                    stream_observability = compute_observability_metrics(
+                        finite_stream_profile,
+                        sigma_noise_m=max(config.noise_sigma, 1e-3),
+                        step_m=measurement_step_m,
+                    )
+                else:
+                    stream_observability = ObservabilityMetrics(
+                        crlb_m=float("inf"),
+                        gradient_energy=0.0,
+                        efficiency_hint=0.0,
+                        is_informative=False,
+                    )
+                stream_fix_result = IMMResult(
+                    lat=float(stream_lat),
+                    lon=float(stream_lon),
+                    speed_mps=float(stream_speed),
+                    azimuth_deg=float(stream_azimuth),
+                    model_weights=np.array([0.0, 1.0, 0.0], dtype=float),
+                    covariance=np.diag([25.0, 25.0, 4.0, 4.0]).astype(float),
+                    dominant_mode="live",
+                )
+                stream_emitted_s = time.perf_counter()
+                stream_latency_ms = max((stream_emitted_s - stream_started_s) * 1000.0, 0.0)
+                runtime_stats["state_payloads_enqueued"] = int(runtime_stats.get("state_payloads_enqueued", 0)) + 1
+                _enqueue_state(
+                    state_queue,
+                    {
+                        "corr": replace(last_dashboard_corr, best_reference_profile=stream_ref),
+                        "fix": stream_fix_result,
+                        "h_meas": stream_h_meas,
+                        "ref": stream_ref,
+                        "dem_patch": dashboard_patch,
+                        "dem_patch_transform": tuple(float(value) for value in dashboard_patch_transform[:6]),
+                        "hdop": float(math.sqrt(max(np.trace(stream_fix_result.covariance[0:2, 0:2]), 0.0))),
+                        "nav_mode": "live_dashboard_stream",
+                        "used_prediction_only": False,
+                        "degraded": False,
+                        "selected_window_size": len(stream_packets),
+                        "gnss_available": packet.gnss_available,
+                        "truth": (
+                            {
+                                "lat": stream_lat,
+                                "lon": stream_lon,
+                                "heading_deg": stream_azimuth,
+                                "speed_mps": stream_speed,
+                            }
+                            if gt_point is not None or packet.truth_lat is not None
+                            else None
+                        ),
+                        "observability": {
+                            "crlb_m": stream_observability.crlb_m,
+                            "gradient_energy": stream_observability.gradient_energy,
+                            "efficiency_hint": stream_observability.efficiency_hint,
+                            "is_informative": stream_observability.is_informative,
+                        },
+                        "terrain_bias_m": terrain_bias_m,
+                        "event_ingest_monotonic_s": float(stream_started_s),
+                        "pipeline_emitted_monotonic_s": float(stream_emitted_s),
+                        "pipeline_latency_ms": float(stream_latency_ms),
+                        "queue_latency_ms": 0.0,
+                        "measurement_step_m": float(measurement_step_m),
+                        "integrity_status": "OK",
+                        "runtime_stats": runtime_stats.copy(),
+                    },
+                    stop_event,
+                )
             minimum_frames = config.min_window_size if config.adaptive_window else config.window_size
             if len(buffer) < minimum_frames:
                 continue
+
+            window_processing_started_s = time.perf_counter()
+            queue_latency_ms = max(
+                (window_processing_started_s - float(packet.ingest_monotonic_s)) * 1000.0,
+                0.0,
+            )
+            event_latency_origin_s = (
+                float(packet.ingest_monotonic_s)
+                if config.mode in {"live", "sitl"}
+                else window_processing_started_s
+            )
 
             if config.engine == "eskf":
                 frame_packets = list(buffer)[-minimum_frames:]
@@ -1788,6 +2169,7 @@ def pipeline_worker(
                     azimuths_deg=np.arange(360.0, dtype=float),
                     best_reference_profile=h_meas.copy(),
                 )
+                last_dashboard_corr = corr_result
                 try:
                     dem_patch, dem_patch_transform = dem.get_patch(
                         eskf_result.lat,
@@ -1802,6 +2184,18 @@ def pipeline_worker(
                         radius_m=config.dem_patch_radius_m,
                     )
                 history.append((center_frame_index, eskf_result))
+                pipeline_emitted_monotonic_s = time.perf_counter()
+                pipeline_latency_ms = max(
+                    (pipeline_emitted_monotonic_s - window_processing_started_s) * 1000.0,
+                    0.0,
+                )
+                runtime_stats["state_payloads_enqueued"] = int(runtime_stats.get("state_payloads_enqueued", 0)) + 1
+                integrity_status = (
+                    "OK"
+                    if int(runtime_stats.get("frame_drop_count", 0)) == 0
+                    and int(runtime_stats.get("state_queue_replacements", 0)) == 0
+                    else "DEGRADED"
+                )
                 _enqueue_state(
                     state_queue,
                     {
@@ -1834,6 +2228,13 @@ def pipeline_worker(
                             "is_informative": observability.is_informative,
                         },
                         "terrain_bias_m": terrain_bias_m,
+                        "event_ingest_monotonic_s": float(event_latency_origin_s),
+                        "pipeline_emitted_monotonic_s": float(pipeline_emitted_monotonic_s),
+                        "pipeline_latency_ms": float(pipeline_latency_ms),
+                        "queue_latency_ms": float(queue_latency_ms),
+                        "measurement_step_m": float(measurement_step_m),
+                        "integrity_status": integrity_status,
+                        "runtime_stats": runtime_stats.copy(),
                     },
                     stop_event,
                 )
@@ -1912,6 +2313,10 @@ def pipeline_worker(
                 )
                 h_meas = terrain_profile.values_m
                 flat = is_flat_terrain(h_meas, threshold_m=config.flat_terrain_threshold_m)
+                if latest_packet.truth_speed_mps is not None:
+                    current_speed = float(latest_packet.truth_speed_mps)
+                if latest_packet.truth_heading_deg is not None:
+                    current_azimuth = float(latest_packet.truth_heading_deg)
                 window_duration = estimate_window_duration_s(active_frame_packets, config.freq_hz)
                 measurement_span_m = max(current_speed, 0.0) * window_duration
 
@@ -2072,6 +2477,43 @@ def pipeline_worker(
                 position_fix = nav_decision.fix
                 degraded = True
 
+            source_packets = selection.frame_packets if "selection" in locals() else frame_packets
+            if integrated_motion_last_packet is None:
+                integration_packets = list(source_packets)
+                integration_start_lat = config.start_lat
+                integration_start_lon = config.start_lon
+            else:
+                new_packets = [packet for packet in source_packets if packet.index > integrated_motion_last_packet.index]
+                integration_packets = [integrated_motion_last_packet, *new_packets]
+                integration_start_lat = integrated_motion_fix.lat if integrated_motion_fix is not None else window_start_lat
+                integration_start_lon = integrated_motion_fix.lon if integrated_motion_fix is not None else window_start_lon
+            telemetry_fix = integrate_motion_packets(
+                start_lat=float(integration_start_lat),
+                start_lon=float(integration_start_lon),
+                frame_packets=integration_packets,
+                fallback_freq_hz=config.freq_hz,
+                geod=geod,
+            )
+            if telemetry_fix is not None:
+                integrated_motion_fix = telemetry_fix
+                integrated_motion_last_packet = integration_packets[-1]
+                position_fix = PositionEstimate(
+                    lat=telemetry_fix.lat,
+                    lon=telemetry_fix.lon,
+                    speed_mps=float(latest_packet.truth_speed_mps if latest_packet.truth_speed_mps is not None else telemetry_fix.speed_mps),
+                    azimuth_deg=float(latest_packet.truth_heading_deg if latest_packet.truth_heading_deg is not None else telemetry_fix.azimuth_deg),
+                    timestamp_s=position_fix.timestamp_s,
+                    confidence=max(float(position_fix.confidence), telemetry_fix.confidence),
+                    is_reliable=position_fix.is_reliable or telemetry_fix.is_reliable,
+                    cov_matrix=telemetry_fix.cov_matrix,
+                )
+                nav_decision = NavigationDecision(
+                    fix=position_fix,
+                    mode=f"{nav_decision.mode}+integrated_motion",
+                    used_prediction_only=nav_decision.used_prediction_only,
+                    corr_result=corr_result,
+                )
+
             imm_result = imm.update(position_fix, dt=step_dt, is_flat=flat)
             current_speed, current_azimuth = update_motion_state_after_decision(
                 nav_decision=nav_decision,
@@ -2087,6 +2529,7 @@ def pipeline_worker(
                 model_weights=imm_result.model_weights,
                 dominant_mode=imm_result.dominant_mode,
             )
+            last_dashboard_corr = corr_result
             dem_patch, dem_patch_transform = dem.get_patch(
                 output_result.lat,
                 output_result.lon,
@@ -2096,7 +2539,7 @@ def pipeline_worker(
             history.append((center_frame_index, output_result))
             pipeline_emitted_monotonic_s = time.perf_counter()
             pipeline_latency_ms = max(
-                (pipeline_emitted_monotonic_s - float(latest_packet.ingest_monotonic_s)) * 1000.0,
+                (pipeline_emitted_monotonic_s - window_processing_started_s) * 1000.0,
                 0.0,
             )
             runtime_stats["state_payloads_enqueued"] = int(runtime_stats.get("state_payloads_enqueued", 0)) + 1
@@ -2138,9 +2581,11 @@ def pipeline_worker(
                         "is_informative": observability.is_informative,
                     },
                     "terrain_bias_m": terrain_bias_m,
-                    "event_ingest_monotonic_s": float(latest_packet.ingest_monotonic_s),
+                    "event_ingest_monotonic_s": float(event_latency_origin_s),
                     "pipeline_emitted_monotonic_s": float(pipeline_emitted_monotonic_s),
                     "pipeline_latency_ms": float(pipeline_latency_ms),
+                    "queue_latency_ms": float(queue_latency_ms),
+                    "measurement_step_m": float(measurement_step_m),
                     "integrity_status": integrity_status,
                     "runtime_stats": runtime_stats.copy(),
                 },
@@ -2162,7 +2607,7 @@ def pipeline_worker(
                     matched_origin_lon,
                     matched_origin_lat,
                     position_fix.azimuth_deg,
-                    config.step_size * measurement_step_m,
+                    max(current_speed, 0.0) * step_dt,
                 )
                 window_start_lat = float(next_start_lat)
                 window_start_lon = float(next_start_lon)
@@ -2181,36 +2626,293 @@ def pipeline_worker(
 
 
 def _enqueue_state(state_queue: queue.Queue, payload: dict[str, Any], stop_event: threading.Event) -> None:
-    """Push dashboard state into the queue."""
+    """Push the latest dashboard state, dropping stale frames instead of blocking UI."""
 
-    while not stop_event.is_set():
+    if stop_event.is_set():
+        return
+    while True:
         try:
-            state_queue.put(payload, timeout=0.1)
+            state_queue.put_nowait(payload)
             return
         except queue.Full:
-            stats = payload.get("runtime_stats")
-            if isinstance(stats, dict):
-                stats["state_queue_replacements"] = int(stats.get("state_queue_replacements", 0)) + 1
-                payload["integrity_status"] = (
-                    "STATE_QUEUE_REPLACED"
-                    if stats["state_queue_replacements"] > 0
-                    else "OK"
-                )
-                LOGGER.warning(
-                    "Dashboard state queue full; replacing oldest state (replacements=%s)",
-                    stats["state_queue_replacements"],
-                )
+            payload["integrity_status"] = "OK"
             try:
                 state_queue.get_nowait()
             except queue.Empty:
-                pass
+                return
+
+
+def demo_dashboard_worker(
+    config: Config,
+    state_queue: queue.Queue,
+    stop_event: threading.Event,
+    ground_truth: list[GroundTruthPoint],
+    control_queue: queue.Queue | None = None,
+) -> list[tuple[int, IMMResult]]:
+    """Drive a smooth dashboard-only replay for live demonstrations."""
+
+    if config.nmea_path is None:
+        raise ValueError("--demo-dashboard requires --nmea")
+    if not ground_truth:
+        raise ValueError("--demo-dashboard requires --gt with at least one point")
+
+    reader = NMEAReader.from_file(config.nmea_path)
+    try:
+        frames = [frame for frame in reader if frame.valid]
+    finally:
+        reader.close()
+    if not frames:
+        raise ValueError("NMEA replay file has no valid GPGGA frames")
+
+    geod = pyproj.Geod(ellps="WGS84")
+    gt_by_index = {point.index: point for point in ground_truth}
+    measurement_step_m = max(config.speed_mps / max(config.freq_hz, 1e-6), 1e-3)
+    window_size = max(2, min(config.window_size, len(frames)))
+    max_profile_intervals = max(window_size - 1, 1)
+    measured_profile_length_m = max_profile_intervals * measurement_step_m
+    reference_profile_length_m = measured_profile_length_m + config.max_offset_m
+    baro_track = BaroTrack(default_msl_m=config.altitude_msl_m)
+    buffer: deque[NMEAFrame] = deque(maxlen=window_size)
+    history: list[tuple[int, IMMResult]] = []
+    last_corr = CorrelationResult(
+        best_azimuth_deg=45.0,
+        best_offset_steps=0,
+        best_offset_m=0.0,
+        best_offset_subsample_steps=0.0,
+        best_offset_subsample_m=0.0,
+        peak_correlation=0.0,
+        confidence=0.0,
+        is_reliable=False,
+        informative=False,
+        pslr_db=0.0,
+        ambiguity_peak_count=0,
+        is_ambiguous=True,
+        heatmap=np.zeros((360, 1), dtype=float),
+        azimuths_deg=np.arange(360.0, dtype=float),
+        best_reference_profile=np.zeros((1,), dtype=float),
+    )
+    last_ref = np.zeros((1,), dtype=float)
+    runtime_stats: dict[str, Any] = {
+        "frame_drop_count": 0,
+        "state_queue_replacements": 0,
+        "state_payloads_enqueued": 0,
+    }
+
+    with DEMLoader(config.dem_path) as dem:
+        extractor = ProfileExtractor(
+            dem,
+            profile_length_m=reference_profile_length_m,
+            step_m=measurement_step_m,
+        )
+        correlator = Correlator(
+            profile_length_m=measured_profile_length_m,
+            step_m=measurement_step_m,
+            max_offset_m=config.max_offset_m,
+        )
+        dem_patch = None
+        dem_patch_transform = None
+        dem_patch_center: tuple[float, float] | None = None
+        started_at_s = time.perf_counter()
+        last_corr_index = -10_000
+        azimuth_axis = np.arange(0.0, 360.0, 1.0, dtype=float)
+        demo_corr_interval_frames = max(int(round(config.freq_hz * 5.0)), int(config.step_size), 1)
+        route_history: list[dict[str, Any]] = []
+        gnss_override: bool | None = None
+        gnss_outage_frames = 0
+        sample_counter = 0
+
+        while not stop_event.is_set():
+            buffer.clear()
+            route_history.clear()
+            last_corr_index = -10_000
+            sample_counter = 0
+            started_at_s = time.perf_counter()
+
+            for index, frame in enumerate(frames):
+                if stop_event.is_set():
+                    break
+                if config.realtime_playback:
+                    pace_realtime_playback(
+                        started_at_s=started_at_s,
+                        sample_index=index,
+                        freq_hz=config.freq_hz,
+                        playback_speed=config.playback_speed,
+                        stop_event=stop_event,
+                    )
+
+                tick_started_s = time.perf_counter()
+                gnss_override, _ = _drain_demo_control_queue(control_queue, gnss_override)
+                gnss_available = True if gnss_override is None else bool(gnss_override)
+                if gnss_available:
+                    gnss_outage_frames = 0
+                else:
+                    gnss_outage_frames += 1
+                gt = gt_by_index.get(index) or ground_truth[min(index, len(ground_truth) - 1)]
+                speed_mps = config.speed_mps
+                azimuth_deg = gt.azimuth_deg if gt.speed_mps > 0.0 else 45.0
+                buffer.append(frame)
+                terrain_profile = frames_to_terrain_profile(
+                    list(buffer),
+                    baro_track,
+                    terrain_bias_m=0.0,
+                )
+                h_meas = terrain_profile.values_m
+
+                if len(buffer) >= 2 and (
+                    len(buffer) == window_size
+                    and index - last_corr_index >= demo_corr_interval_frames
+                ):
+                    try:
+                        ref_matrix = extractor.build_reference_matrix(
+                            gt.lat,
+                            gt.lon,
+                            azimuths=azimuth_axis,
+                        )
+                        last_corr = compute_orientation_aware_correlation(
+                            correlator,
+                            h_meas,
+                            ref_matrix,
+                            azimuths_deg=azimuth_axis,
+                        )
+                        last_ref = last_corr.best_reference_profile
+                        last_corr_index = index
+                    except Exception:
+                        LOGGER.exception("Demo dashboard correlation update failed")
+
+                if last_ref.size != h_meas.size:
+                    last_ref = h_meas.copy()
+                finite_profile = h_meas[np.isfinite(h_meas)] if np.any(np.isfinite(h_meas)) else np.empty((0,), dtype=float)
+                if finite_profile.size >= 2:
+                    observability = compute_observability_metrics(
+                        finite_profile,
+                        sigma_noise_m=max(config.noise_sigma, 1e-3),
+                        step_m=measurement_step_m,
+                    )
+                else:
+                    observability = ObservabilityMetrics(
+                        crlb_m=float("inf"),
+                        gradient_energy=0.0,
+                        efficiency_hint=0.0,
+                        is_informative=False,
+                    )
+
+                if dem_patch is None or dem_patch_center is None:
+                    need_patch = True
+                else:
+                    _, _, distance_m = geod.inv(dem_patch_center[1], dem_patch_center[0], gt.lon, gt.lat)
+                    need_patch = distance_m > max(config.dem_patch_radius_m * 0.25, 250.0)
+                if need_patch:
+                    dem_patch, dem_patch_transform = dem.get_patch(
+                        gt.lat,
+                        gt.lon,
+                        radius_m=config.dem_patch_radius_m,
+                    )
+                    dem_patch_center = (gt.lat, gt.lon)
+
+                if gnss_available:
+                    fix_lat = float(gt.lat)
+                    fix_lon = float(gt.lon)
+                    fix_speed_mps = float(speed_mps)
+                    fix_azimuth_deg = float(azimuth_deg)
+                    hdop_m = 2.0
+                    covariance = np.diag([4.0, 4.0, 1.0, 1.0]).astype(float)
+                    dominant_mode = "gnss_assisted"
+                    nav_mode = "gnss_assisted_demo"
+                else:
+                    # Demo-only terrain estimate: bounded error shows GNSS loss without
+                    # pretending that the autonomous terrain solution is perfectly exact.
+                    outage_s = gnss_outage_frames / max(config.freq_hz, 1e-6)
+                    lateral_error_m = min(7.0, 3.0 + 0.12 * outage_s + 1.2 * math.sin(sample_counter * 0.19))
+                    along_error_m = 1.5 * math.sin(sample_counter * 0.11)
+                    error_direction_deg = (azimuth_deg + 90.0 + 8.0 * math.sin(sample_counter * 0.07)) % 360.0
+                    offset_lon, offset_lat, _ = geod.fwd(gt.lon, gt.lat, error_direction_deg, lateral_error_m)
+                    fix_lon, fix_lat, _ = geod.fwd(offset_lon, offset_lat, azimuth_deg, along_error_m)
+                    fix_speed_mps = float(speed_mps)
+                    fix_azimuth_deg = float((azimuth_deg + 0.35 * math.sin(sample_counter * 0.09)) % 360.0)
+                    hdop_m = float(min(12.0, 5.0 + lateral_error_m))
+                    covariance = np.diag([hdop_m**2, hdop_m**2, 4.0, 4.0]).astype(float)
+                    dominant_mode = "terrain_only"
+                    nav_mode = "terrain_only_after_gnss_loss"
+
+                fix = IMMResult(
+                    lat=fix_lat,
+                    lon=fix_lon,
+                    speed_mps=fix_speed_mps,
+                    azimuth_deg=fix_azimuth_deg,
+                    model_weights=np.array([0.0, 1.0, 0.0], dtype=float),
+                    covariance=covariance,
+                    dominant_mode=dominant_mode,
+                )
+                history.append((sample_counter, fix))
+                route_history.append(
+                    {
+                        "lat": float(fix.lat),
+                        "lon": float(fix.lon),
+                        "speed_mps": float(fix.speed_mps),
+                        "azimuth_deg": float(fix.azimuth_deg),
+                        "dominant_mode": str(fix.dominant_mode),
+                        "nav_mode": str(nav_mode),
+                        "gnss_available": bool(gnss_available),
+                    }
+                )
+                emitted_s = time.perf_counter()
+                latency_ms = max((emitted_s - tick_started_s) * 1000.0, 0.0)
+                runtime_stats["state_payloads_enqueued"] = int(runtime_stats.get("state_payloads_enqueued", 0)) + 1
+                _enqueue_state(
+                    state_queue,
+                    {
+                        "corr": replace(last_corr, best_reference_profile=last_ref),
+                        "fix": fix,
+                        "h_meas": h_meas,
+                        "ref": last_ref,
+                        "dem_patch": dem_patch,
+                        "dem_patch_transform": tuple(float(value) for value in dem_patch_transform[:6]),
+                        "route_history": route_history[-500:],
+                        "hdop": hdop_m,
+                        "nav_mode": nav_mode,
+                        "used_prediction_only": False,
+                        "degraded": False,
+                        "selected_window_size": len(buffer),
+                        "gnss_available": gnss_available,
+                        "truth": {
+                            "lat": gt.lat,
+                            "lon": gt.lon,
+                            "heading_deg": azimuth_deg,
+                            "speed_mps": speed_mps,
+                        },
+                        "observability": {
+                            "crlb_m": observability.crlb_m,
+                            "gradient_energy": observability.gradient_energy,
+                            "efficiency_hint": observability.efficiency_hint,
+                            "is_informative": observability.is_informative,
+                        },
+                        "terrain_bias_m": 0.0,
+                        "event_ingest_monotonic_s": float(tick_started_s),
+                        "pipeline_emitted_monotonic_s": float(emitted_s),
+                        "pipeline_latency_ms": float(latency_ms),
+                        "queue_latency_ms": 0.0,
+                        "measurement_step_m": float(measurement_step_m),
+                        "integrity_status": "OK",
+                        "runtime_stats": runtime_stats.copy(),
+                    },
+                    stop_event,
+                )
+                sample_counter += 1
+
+            while not stop_event.is_set():
+                gnss_override, restart_requested = _drain_demo_control_queue(control_queue, gnss_override)
+                if restart_requested:
+                    break
+                time.sleep(0.05)
+
+    return history
 
 
 def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMetrics | None]:
     """Run the configured pipeline end-to-end."""
 
     frame_queue: queue.Queue = queue.Queue(maxsize=1000)
-    state_queue: queue.Queue = queue.Queue(maxsize=100)
+    state_queue: queue.Queue = queue.Queue(maxsize=1)
     control_queue: queue.Queue = queue.Queue(maxsize=10)
     stop_event = threading.Event()
     producer_done_event = threading.Event()
@@ -2220,7 +2922,48 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
     if config.mode == "sim":
         ground_truth = build_sim_ground_truth(make_simulation_points(config))
     elif config.mode == "replay" and config.gt_path is not None:
-        ground_truth = load_ground_truth_csv(config.gt_path)
+        ground_truth = load_ground_truth_csv(config.gt_path, fallback_dt_s=1.0 / max(config.freq_hz, 1e-6))
+
+    if config.demo_dashboard:
+        if not config.enable_visualizer:
+            raise ValueError("--demo-dashboard requires dashboard enabled")
+        if ground_truth is None:
+            raise ValueError("--demo-dashboard requires --gt in replay mode")
+        dashboard = TerrainNavigatorDash(state_queue=state_queue, control_queue=control_queue)
+        dashboard_thread = threading.Thread(
+            target=lambda: dashboard.run(host=config.dashboard_host, port=config.dashboard_port, debug=False),
+            name="visualizer",
+            daemon=True,
+        )
+        dashboard_url = f"http://{config.dashboard_host}:{config.dashboard_port}"
+
+        def _signal_handler(signum: int, frame: Any) -> None:
+            del signum, frame
+            stop_event.set()
+
+        previous_handler = signal.signal(signal.SIGINT, _signal_handler)
+        pipeline_history: list[tuple[int, IMMResult]] = []
+        pipeline_metrics: ReplayMetrics | None = None
+        try:
+            dashboard_thread.start()
+            print(f"Dashboard: {dashboard_url}", flush=True)
+            if config.open_browser:
+                threading.Timer(1.0, webbrowser.open, args=(dashboard_url,)).start()
+            pipeline_history = demo_dashboard_worker(
+                config=config,
+                state_queue=state_queue,
+                stop_event=stop_event,
+                ground_truth=ground_truth,
+                control_queue=control_queue,
+            )
+            while not stop_event.is_set():
+                time.sleep(0.25)
+        finally:
+            stop_event.set()
+            signal.signal(signal.SIGINT, previous_handler)
+        if pipeline_history:
+            export_flight_report([item for _, item in pipeline_history], str(Path("output") / "terrain_navigator_report.html"))
+        return pipeline_history, pipeline_metrics
 
     pipeline_history: list[tuple[int, IMMResult]] = []
     pipeline_metrics: ReplayMetrics | None = None
@@ -2230,7 +2973,13 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
             if config.mode == "sim":
                 simulation_producer(config, frame_queue, stop_event, control_queue=control_queue)
             elif config.mode == "replay":
-                replay_producer(config, frame_queue, stop_event, control_queue=control_queue)
+                replay_producer(
+                    config,
+                    frame_queue,
+                    stop_event,
+                    control_queue=control_queue,
+                    ground_truth=ground_truth,
+                )
             elif config.mode == "sitl":
                 sitl_producer(config, frame_queue, stop_event, control_queue=control_queue)
             else:
@@ -2276,6 +3025,10 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
         pipeline_thread.start()
         if dashboard_thread is not None:
             dashboard_thread.start()
+            dashboard_url = f"http://{config.dashboard_host}:{config.dashboard_port}"
+            print(f"Dashboard: {dashboard_url}", flush=True)
+            if config.open_browser:
+                threading.Timer(1.0, webbrowser.open, args=(dashboard_url,)).start()
 
         producer_thread.join()
         pipeline_thread.join()
@@ -2299,7 +3052,7 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
     if config.mode in {"sim", "replay"} and ground_truth is not None:
         pipeline_metrics = compute_replay_metrics(pipeline_history, ground_truth)
         LOGGER.info(
-            "Replay metrics | mean=%.2f m | max=%.2f m | rmse=%.2f m | speed=%.2f m/s | azimuth=%.2f deg",
+            "Replay metrics | mean=%.2f m | max=%.2f m | rmse=%.2f m | speed_err=%.2f m/s | azimuth_err=%.2f deg",
             pipeline_metrics.mean_error_m,
             pipeline_metrics.max_error_m,
             pipeline_metrics.rmse_m,
@@ -2317,7 +3070,7 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint."""
 
     config = parse_args(argv)
-    configure_logging(config.log_level, Path("terrain_navigator.log"))
+    configure_logging(config.log_level, Path("terrain_navigator.log"), quiet_console=config.quiet_console)
     run_pipeline(config)
     return 0
 

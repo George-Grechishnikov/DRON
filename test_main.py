@@ -19,6 +19,7 @@ from main import (
     choose_navigation_fix,
     compute_replay_metrics,
     estimate_window_duration_s,
+    _drain_demo_control_queue,
     maybe_select_turn_transition_window,
     maybe_trim_turn_transition_tail,
     maybe_update_heading_from_correlation,
@@ -68,6 +69,19 @@ def test_parse_args_replay_mode() -> None:
     assert config.mode == "replay"
     assert config.nmea_path == Path("logs/flight.nmea")
     assert config.gt_path == Path("logs/gt.csv")
+
+
+def test_drain_demo_control_queue_handles_restart_and_gnss() -> None:
+    import queue
+
+    control_queue: queue.Queue = queue.Queue()
+    control_queue.put({"type": "set_gnss_enabled", "enabled": False})
+    control_queue.put({"type": "restart_route"})
+
+    gnss_override, restart_requested = _drain_demo_control_queue(control_queue, None)
+
+    assert gnss_override is False
+    assert restart_requested is True
 
 
 def test_parse_args_adaptive_window_mode() -> None:

@@ -89,7 +89,7 @@ def test_update_all_panels_returns_figures_and_store() -> None:
         }
     )
 
-    heatmap_fig, terrain_fig, profiles_fig, telemetry_fig, store = dash_app.update_all_panels(
+    heatmap_fig, terrain_fig, profiles_fig, telemetry_fig, metrics_panel, store = dash_app.update_all_panels(
         1,
         {"history": []},
     )
@@ -98,6 +98,7 @@ def test_update_all_panels_returns_figures_and_store() -> None:
     assert len(terrain_fig.data) >= 6
     assert len(profiles_fig.data) >= 2
     assert len(telemetry_fig.data) >= 2
+    assert len(metrics_panel) >= 8
     assert len(store["history"]) == 1
     assert "latest_state" in store
     assert any("Режим навигации" in annotation["text"] for annotation in telemetry_fig.layout.annotations)
@@ -154,13 +155,49 @@ def test_metrics_panel_can_be_rebuilt_from_store_summary() -> None:
         }
     )
 
-    _, _, _, _, store = dash_app.update_all_panels(1, {"history": []})
+    _, _, _, _, _, store = dash_app.update_all_panels(1, {"history": []})
     metrics_panel = dash_app._build_metrics_panel(store["latest_state"])
 
     values = [str(card.children[0].children) for card in metrics_panel]
     assert len(metrics_panel) >= 8
     assert "Задержка реакции" in values
     assert "Целостность" in values
+
+def test_update_all_panels_keeps_all_queued_route_points() -> None:
+    state_queue: queue.Queue = queue.Queue()
+    dash_app = TerrainNavigatorDash(state_queue=state_queue)
+    for idx in range(3):
+        base_fix = _fake_fix()
+        fix = IMMResult(
+            lat=base_fix.lat + idx * 0.0001,
+            lon=base_fix.lon + idx * 0.0001,
+            speed_mps=base_fix.speed_mps,
+            azimuth_deg=base_fix.azimuth_deg,
+            model_weights=base_fix.model_weights,
+            covariance=base_fix.covariance,
+            dominant_mode=base_fix.dominant_mode,
+        )
+        state_queue.put(
+            {
+                "corr": _fake_corr(),
+                "fix": fix,
+                "h_meas": np.array([101.0, 107.0, 102.0], dtype=float),
+                "ref": np.array([100.0, 105.0, 103.0], dtype=float),
+                "dem_patch": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=float),
+                "dem_patch_transform": (0.001, 0.0, 90.299, 0.0, -0.001, 60.501),
+                "observability": {},
+                "runtime_stats": {},
+            }
+        )
+
+    _, terrain_fig, _, _, metrics_panel, store = dash_app.update_all_panels(1, {"history": []})
+
+    assert len(store["history"]) == 3
+    assert len(metrics_panel) >= 8
+    assert terrain_fig.layout.uirevision == "terrain-map-zoom"
+    trajectory_trace = next(trace for trace in terrain_fig.data if "Траектория" in str(trace.name))
+    assert len(trajectory_trace.x) == 3
+    assert trajectory_trace.mode == "markers"
 
 
 def test_create_arrow_shape_returns_three_segments() -> None:
@@ -198,3 +235,36 @@ def test_send_control_command_pushes_to_control_queue() -> None:
     dash_app.send_control_command({"type": "set_gnss_enabled", "enabled": False})
 
     assert control_queue.get_nowait() == {"type": "set_gnss_enabled", "enabled": False}
+
+
+def test_send_restart_route_command_pushes_to_control_queue() -> None:
+    state_queue: queue.Queue = queue.Queue()
+    control_queue: queue.Queue = queue.Queue()
+    dash_app = TerrainNavigatorDash(state_queue=state_queue, control_queue=control_queue)
+
+    dash_app.send_control_command({"type": "restart_route"})
+
+    assert control_queue.get_nowait() == {"type": "restart_route"}
+
+
+def test_manual_gnss_override_is_reflected_in_dashboard_store() -> None:
+    state_queue: queue.Queue = queue.Queue()
+    dash_app = TerrainNavigatorDash(state_queue=state_queue)
+    dash_app._manual_gnss_enabled = False
+    state_queue.put(
+        {
+            "corr": _fake_corr(),
+            "fix": _fake_fix(),
+            "h_meas": np.array([101.0, 107.0, 102.0], dtype=float),
+            "ref": np.array([100.0, 105.0, 103.0], dtype=float),
+            "dem_patch": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=float),
+            "dem_patch_transform": (0.001, 0.0, 90.299, 0.0, -0.001, 60.501),
+            "observability": {},
+            "runtime_stats": {},
+            "gnss_available": True,
+        }
+    )
+
+    _, _, _, _, _, store = dash_app.update_all_panels(1, {"history": []})
+
+    assert store["latest_state"]["gnss_available"] is False

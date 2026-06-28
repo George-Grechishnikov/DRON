@@ -3,4 +3,11 @@ __pycache__/
 *.pyc
 output/
 terrain_navigator.log
+terrain_navigator_probe.log
 data/fabdem_cache/
+data/uav_3m_dataset/uav_3m_dataset/
+data/uav_3m_dataset/quick_5000/
+terrain_nav_core/build/
+terrain_nav_core/Release/
+terrain_nav_core/*.pyd
+terrain_nav_core/*.lib

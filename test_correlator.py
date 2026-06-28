@@ -3,8 +3,10 @@ from __future__ import annotations
 import time
 
 import numpy as np
+import pytest
 
 from constants import FIXED_BARO_ALTITUDE_M
+import correlator as correlator_module
 from correlator import PSR_THRESHOLD, Correlator, build_heatmap, compute_crlb_position, compute_observability_metrics, parabolic_vertex
 from nmea_parser import NMEAFrame
 
@@ -242,6 +244,66 @@ def test_hybrid_metric_preserves_absolute_level_better_than_ncc() -> None:
     assert ncc_result.best_offset_steps == 0
     assert hybrid_result.best_offset_steps == len(base)
     assert hybrid_result.msd_peak > ncc_result.msd_peak
+
+
+def test_compute_can_use_native_heatmap_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    azimuths = np.arange(12, dtype=float)
+    length = 32
+    offset_steps = 6
+    ref_matrix = _make_reference_matrix(12, length, offset_steps)
+    h_meas = ref_matrix[5, 4 : 4 + length]
+
+    def fake_cpp_available() -> bool:
+        return True
+
+    def fake_native_heatmaps(
+        measured_profile: np.ndarray,
+        reference_profiles: np.ndarray,
+        *,
+        usable_offsets: int,
+        metric: str,
+        alpha: float,
+        beta: float,
+        msd_scale_m2: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        del metric, alpha, beta, msd_scale_m2
+        helper = Correlator(profile_length_m=960.0, step_m=30.0, max_offset_m=180.0)
+        rows = []
+        ncc_rows = []
+        msd_rows = []
+        measured = np.asarray(measured_profile, dtype=float)
+        h_centered = measured - float(np.mean(measured))
+        h_std = float(np.std(measured))
+        for ref_values in np.asarray(reference_profiles, dtype=float):
+            ncc = helper._ncc_scores(
+                ref_values=ref_values,
+                h_centered=h_centered,
+                h_std=h_std,
+                usable_offsets=usable_offsets,
+                window_length=measured.size,
+            )
+            msd = helper._msd_scores(
+                ref_values=ref_values,
+                h_meas=measured,
+                usable_offsets=usable_offsets,
+                window_length=measured.size,
+            )
+            rows.append(helper._combine_metric_scores(ncc, msd))
+            ncc_rows.append(ncc)
+            msd_rows.append(msd)
+        return np.asarray(rows), np.asarray(ncc_rows), np.asarray(msd_rows)
+
+    monkeypatch.setattr(correlator_module, "cpp_backend_available", fake_cpp_available)
+    monkeypatch.setattr(correlator_module, "compute_hybrid_heatmaps", fake_native_heatmaps)
+
+    result = Correlator(profile_length_m=960.0, step_m=30.0, max_offset_m=180.0).compute(
+        h_meas,
+        ref_matrix,
+        azimuths_deg=azimuths,
+    )
+
+    assert np.isclose(result.best_azimuth_deg, 5.0, atol=0.5)
+    assert result.best_offset_steps == 4
 
 
 def test_hybrid_metric_reduces_false_confidence_on_flat_terrain() -> None:

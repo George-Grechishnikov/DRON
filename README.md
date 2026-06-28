@@ -210,6 +210,33 @@ Correlation benchmark for desktop / Jetson / Raspberry Pi:
 python .\benchmark_correlator.py --iterations 20
 ```
 
+Optional C++ correlation backend:
+
+- the project runs without C++; Python/NumPy/SciPy fallback is always available
+- C++ backend is used automatically when `terrain_nav_core\_terrain_nav_core*.pyd` is built
+- on Windows install Microsoft C++ Build Tools first, then run:
+
+```powershell
+.\scripts\build_cpp_backend.ps1
+python -c "import correlation_fallback; print(correlation_fallback.cpp_backend_available())"
+```
+
+Standard replay launch with C++ correlation check and 10 Hz point-by-point dashboard trajectory:
+
+```powershell
+.\run_standard_replay.ps1
+```
+
+This opens the dashboard, plays NMEA at `--freq 10`, and draws one trajectory point for each sample while the correlation window remains `64` frames for accuracy.
+The demo uses fixed case parameters: barometric altitude `1500 m` and display speed `50 m/s`.
+When the replay reaches the end of the route, it stays on the final point and waits for the dashboard button `СТАРТ / ЗАНОВО` before clearing the path and starting again.
+
+For fast metrics without the browser:
+
+```powershell
+.\run_standard_replay.ps1 -NoVisualizer
+```
+
 Current MVP limitations and honest claims:
 
 - validated well on synthetic and local integration scenarios, not yet on flight-grade real datasets
