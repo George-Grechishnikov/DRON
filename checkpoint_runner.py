@@ -1,13 +1,9 @@
-"""Checkpoint input adapter for the Адриадна terrain-navigation pipeline.
+"""Case input adapter for the Адриадна terrain-navigation pipeline.
 
-The technical checkpoint format is intentionally simple:
-    * one text file with one radar-altimeter height per line, meters;
-    * start point as (x, y);
-    * initial heading, speed and radar-altimeter frequency;
-    * DEM GeoTIFF.
-
-This adapter converts that input into the existing replay pipeline, then writes
-both local ENU-like trajectory coordinates and global WGS84 coordinates.
+The hackathon case input is a DEM GeoTIFF plus radar-altimeter messages in
+NMEA-0183 GPGGA/GNGGA format. The adapter validates that stream, runs the replay
+pipeline from the DEM center by default, and writes both local ENU-like
+trajectory coordinates and global WGS84 coordinates.
 """
 
 from __future__ import annotations
@@ -25,7 +21,9 @@ import rasterio
 from rasterio.enums import Resampling
 
 from constants import FIXED_BARO_ALTITUDE_M
-from main import Config, configure_logging, run_pipeline
+from main import Config, configure_logging, resolve_initial_coordinates, run_pipeline
+from measurement_layer import parse_nmea_timestamp_to_seconds
+from nmea_parser import NMEAReader
 from sim_generator import format_gpgga
 
 
@@ -48,6 +46,40 @@ def read_heights(path: Path) -> np.ndarray:
     if not values:
         raise ValueError(f"Height file is empty: {path}")
     return np.asarray(values, dtype=float)
+
+
+def validate_nmea_file(path: Path) -> tuple[int, float | None]:
+    """Validate a case NMEA file and return (valid_frame_count, inferred_freq_hz)."""
+
+    reader = NMEAReader.from_file(path)
+    try:
+        frames = list(reader)
+    finally:
+        reader.close()
+    valid_frames = [frame for frame in frames if frame.valid and np.isfinite(frame.radar_alt_m)]
+    if not valid_frames:
+        raise ValueError(f"NMEA file has no valid GPGGA/GNGGA radar-altimeter frames: {path}")
+
+    timestamps = np.asarray(
+        [parse_nmea_timestamp_to_seconds(frame.timestamp_utc) for frame in valid_frames],
+        dtype=float,
+    )
+    timestamps = timestamps[np.isfinite(timestamps)]
+    if timestamps.size < 2:
+        return len(valid_frames), None
+
+    deltas = np.diff(timestamps)
+    deltas = deltas[deltas > 1e-6]
+    if deltas.size == 0:
+        return len(valid_frames), None
+    inferred_freq_hz = 1.0 / float(np.median(deltas))
+    freq_tolerance_hz = 1e-6
+    if inferred_freq_hz < (1.0 - freq_tolerance_hz) or inferred_freq_hz > (10.0 + freq_tolerance_hz):
+        raise ValueError(
+            "NMEA message frequency must be within 1-10 Hz by case requirements; "
+            f"inferred {inferred_freq_hz:.2f} Hz from timestamps"
+        )
+    return len(valid_frames), float(inferred_freq_hz)
 
 
 def write_nmea_from_heights(
@@ -270,15 +302,17 @@ def write_trajectory_html(
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run Адриадна on the technical-checkpoint input format")
+    parser = argparse.ArgumentParser(description="Run Адриадна on the hackathon DEM + NMEA case format")
     parser.add_argument("--dem", required=True, type=Path, help="DEM GeoTIFF from experts")
-    parser.add_argument("--heights", required=True, type=Path, help="Text file: one height in meters per line")
-    parser.add_argument("--start-x", required=True, type=float, help="Initial x coordinate")
-    parser.add_argument("--start-y", required=True, type=float, help="Initial y coordinate")
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument("--nmea", type=Path, help="NMEA-0183 GPGGA/GNGGA radar-altimeter log")
+    input_group.add_argument("--heights", type=Path, help="Legacy text file: one height in meters per line")
+    parser.add_argument("--start-x", type=float, help="Optional initial x coordinate; defaults to DEM center")
+    parser.add_argument("--start-y", type=float, help="Optional initial y coordinate; defaults to DEM center")
     parser.add_argument("--xy-mode", choices=("auto", "pixel", "crs", "local-m"), default="auto", help="How to interpret start x/y")
-    parser.add_argument("--heading", required=True, type=float, help="Initial heading/course, degrees clockwise from north")
+    parser.add_argument("--heading", type=float, default=0.0, help="Initial heading/course hint, degrees clockwise from north")
     parser.add_argument("--speed", required=True, type=float, help="Initial aircraft speed, m/s")
-    parser.add_argument("--freq", required=True, type=float, help="Radar-altimeter frequency, Hz")
+    parser.add_argument("--freq", type=float, help="Radar-altimeter frequency, Hz; inferred from NMEA timestamps when omitted")
     parser.add_argument("--input-kind", choices=("radar", "terrain"), default="radar", help="heights file contains radar AGL heights or already reconstructed terrain heights")
     parser.add_argument("--baro-alt", type=float, default=FIXED_BARO_ALTITUDE_M, help="Constant barometric altitude MSL, meters")
     parser.add_argument("--window-size", type=int, default=64, help="Correlation window size in samples")
@@ -297,27 +331,47 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.speed <= 0:
         parser.error("--speed must be positive")
-    if args.freq <= 0:
+    if args.freq is not None and args.freq <= 0:
         parser.error("--freq must be positive")
     if args.window_size <= 1:
         parser.error("--window-size must be greater than 1")
     if args.step_size <= 0:
         parser.error("--step-size must be positive")
+    if (args.start_x is None) != (args.start_y is None):
+        parser.error("--start-x and --start-y must be provided together")
 
     configure_logging("WARNING", Path("terrain_navigator.log"), quiet_console=bool(args.quiet_console))
-    heights_m = read_heights(args.heights)
-    start_lat, start_lon, resolved_xy_mode = resolve_start_latlon(args.dem, args.start_x, args.start_y, args.xy_mode)
+    if args.start_x is None and args.start_y is None:
+        start_lat, start_lon = resolve_initial_coordinates(args.dem, float("nan"), float("nan"))
+        resolved_xy_mode = "dem-center"
+    else:
+        start_lat, start_lon, resolved_xy_mode = resolve_start_latlon(args.dem, float(args.start_x), float(args.start_y), args.xy_mode)
+
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    nmea_path = args.out_dir / "checkpoint_input.nmea"
+    nmea_path = args.out_dir / "case_input.nmea"
     csv_path = args.out_dir / "trajectory_estimated.csv"
     html_path = args.out_dir / "trajectory_visualization.html"
-    write_nmea_from_heights(
-        heights_m=heights_m,
-        output_path=nmea_path,
-        freq_hz=float(args.freq),
-        input_kind=str(args.input_kind),
-        baro_alt_m=float(args.baro_alt),
-    )
+    if args.nmea is not None:
+        valid_count, inferred_freq_hz = validate_nmea_file(args.nmea)
+        nmea_path = args.nmea
+        freq_hz = float(args.freq if args.freq is not None else (inferred_freq_hz if inferred_freq_hz is not None else 5.0))
+        if not (1.0 <= freq_hz <= 10.0):
+            parser.error("--freq must be within 1-10 Hz by case requirements")
+    else:
+        if args.freq is None:
+            parser.error("--freq is required when --heights is used")
+        if not (1.0 <= float(args.freq) <= 10.0):
+            parser.error("--freq must be within 1-10 Hz by case requirements")
+        heights_m = read_heights(args.heights)
+        write_nmea_from_heights(
+            heights_m=heights_m,
+            output_path=nmea_path,
+            freq_hz=float(args.freq),
+            input_kind=str(args.input_kind),
+            baro_alt_m=float(args.baro_alt),
+        )
+        valid_count, _ = validate_nmea_file(nmea_path)
+        freq_hz = float(args.freq)
 
     config = Config(
         mode="replay",
@@ -346,7 +400,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_window_size=int(args.window_size),
         window_growth_step=int(args.step_size),
         step_size=int(args.step_size),
-        freq_hz=float(args.freq),
+        freq_hz=freq_hz,
         dem_patch_radius_m=float(args.dem_patch_radius),
         max_offset_m=float(args.max_offset),
         flat_terrain_threshold_m=15.0,
@@ -366,7 +420,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         history=history,
         start_lat=start_lat,
         start_lon=start_lon,
-        freq_hz=float(args.freq),
+        freq_hz=freq_hz,
     )
     write_trajectory_html(
         dem_path=args.dem,
@@ -377,6 +431,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     print(f"Resolved start: lat={start_lat:.8f}, lon={start_lon:.8f}, xy_mode={resolved_xy_mode}")
     print(f"NMEA input: {nmea_path}")
+    print(f"Valid NMEA frames: {valid_count}, freq_hz={freq_hz:.3f}")
     print(f"Trajectory CSV: {csv_path}")
     print(f"Visualization HTML: {html_path}")
     print(f"Estimated points: {len(history)}")

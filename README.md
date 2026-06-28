@@ -251,7 +251,7 @@ Current MVP limitations and honest claims:
 
 `sim_generator.py` умеет:
 - читать `GeoTIFF` с рельефом
-- строить маршрут по заданной траектории
+- строить прямой маршрут по явно заданным азимуту, скорости и длине
 - вычислять высоту над рельефом
 - добавлять шум радиовысотомера
 - формировать валидные строки `GPGGA`
@@ -264,15 +264,14 @@ python .\sim_generator.py `
   --dem .\data\dem.tif `
   --lat 60.5 `
   --lon 90.3 `
-  --trajectory 1 `
+  --azimuth 45 `
+  --length-km 10 `
   --noise 2.0 `
   --freq 5 `
   --output file `
   --out-nmea .\output\traj1.nmea `
   --out-csv .\output\traj1_ground_truth.csv
 ```
-
-Поддерживаются траектории:
 - `1` — прямолинейная
 - `2` — с поворотом
 - `3` — с набором высоты
@@ -470,11 +469,11 @@ dashboard.run(host="127.0.0.1", port=8050, debug=False)
 Примеры запуска:
 
 ```powershell
-python .\main.py --sim --dem .\data\dem.tif --trajectory 1 --lat 60.5 --lon 90.3
+python .\main.py --sim --dem .\data\dem.tif --lat 60.5 --lon 90.3 --initial-heading 45 --sim-length-km 10
 ```
 
 ```powershell
-python .\main.py --sim --dem .\data\dem.tif --trajectory 1 --adaptive-window --min-window-size 20 --max-window-size 50 --window-growth-step 10
+python .\main.py --sim --dem .\data\dem.tif --initial-heading 45 --sim-length-km 10 --adaptive-window --min-window-size 20 --max-window-size 50 --window-growth-step 10
 ```
 
 ```powershell
@@ -488,7 +487,7 @@ python .\main.py --replay --dem .\data\dem.tif --nmea .\logs\flight.nmea --gt .\
 Если нужно прогонять вычисления без UI:
 
 ```powershell
-python .\main.py --sim --dem .\data\dem.tif --trajectory 1 --no-visualizer
+python .\main.py --sim --dem .\data\dem.tif --initial-heading 45 --sim-length-km 10 --no-visualizer
 ```
 
 ## Как запускать то, что уже есть

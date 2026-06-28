@@ -4,7 +4,8 @@ param(
     [string]$GtPath = ".\output\case_demo_gt.csv",
     [double]$Lat = -35.36,
     [double]$Lon = 149.05,
-    [int]$Trajectory = 1,
+    [double]$AzimuthDeg = 45.0,
+    [double]$LengthKm = 10.0,
     [double]$FreqHz = 5.0
 )
 
@@ -20,7 +21,8 @@ python .\sim_generator.py `
   --dem $DemPath `
   --lat $Lat `
   --lon $Lon `
-  --trajectory $Trajectory `
+  --azimuth $AzimuthDeg `
+  --length-km $LengthKm `
   --freq $FreqHz `
   --output file `
   --out-nmea $NmeaPath `

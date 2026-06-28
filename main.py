@@ -56,7 +56,7 @@ class Config:
     dem_path: Path
     start_lat: float
     start_lon: float
-    trajectory: int
+    trajectory: int | None
     nmea_path: Path | None
     gt_path: Path | None
     sitl_connection: str
@@ -71,6 +71,7 @@ class Config:
     speed_mps: float
     altitude_msl_m: float
     noise_sigma: float
+    sim_length_km: float = 10.0
     initial_heading_deg: float = 45.0
     window_size: int = 50
     adaptive_window: bool = False
@@ -185,7 +186,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dem", required=True, type=Path, help="Path to DEM GeoTIFF")
     parser.add_argument("--lat", type=float, help="Initial latitude; defaults to DEM center when omitted")
     parser.add_argument("--lon", type=float, help="Initial longitude; defaults to DEM center when omitted")
-    parser.add_argument("--trajectory", type=int, default=1, choices=(1, 2, 3), help="Simulation trajectory id")
+    parser.add_argument("--trajectory", type=int, choices=(1, 2, 3), help="Legacy simulation trajectory id")
+    parser.add_argument("--sim-length-km", type=float, default=10.0, help="Default straight simulation route length in kilometers")
     parser.add_argument("--nmea", type=Path, help="Replay NMEA file path")
     parser.add_argument("--gt", type=Path, help="Ground-truth CSV file path")
     parser.add_argument("--sitl-connect", default="udp:127.0.0.1:14550", help="MAVLink connection string for SITL")
@@ -235,6 +237,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         parser.error("--step-size must be positive")
     if args.playback_speed <= 0:
         parser.error("--playback-speed must be positive")
+    if args.sim_length_km <= 0:
+        parser.error("--sim-length-km must be positive")
 
     adaptive_window = bool(args.adaptive_window)
     min_window_size = int(args.min_window_size if args.min_window_size is not None else args.window_size)
@@ -267,6 +271,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         initial_heading_deg=float(args.initial_heading % 360.0),
         altitude_msl_m=FIXED_BARO_ALTITUDE_M,
         noise_sigma=args.noise,
+        sim_length_km=float(args.sim_length_km),
         window_size=args.window_size,
         adaptive_window=adaptive_window,
         min_window_size=min_window_size,
@@ -429,9 +434,9 @@ def make_simulation_points(config: Config) -> list[TrajectoryPoint]:
         random_seed=config.seed,
         altitude_msl_m=config.altitude_msl_m,
         speed_mps=config.speed_mps,
-        azimuth_deg=45.0,
+        azimuth_deg=config.initial_heading_deg,
         duration_s=None,
-        length_km=None,
+        length_km=None if config.trajectory is not None else config.sim_length_km,
         trajectory_id=config.trajectory,
     )
     return generate_points(sim_config)

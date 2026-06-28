@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import base64
 import binascii
+import csv
 import json
 import math
 import logging
 import queue
+import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -16,13 +20,19 @@ from dash import Dash, Input, Output, State, ctx, dcc, html, no_update
 import numpy as np
 import plotly.graph_objects as go
 from plotly.offline import plot as offline_plot
+import pyproj
+import rasterio
+from rasterio.enums import Resampling
 
 from correlator import CorrelationResult, build_heatmap
 from imm_filter import IMMResult
+from measurement_layer import parse_nmea_timestamp_to_seconds
+from nmea_parser import NMEAReader
 
 
 LOGGER = logging.getLogger(__name__)
 CHECKPOINT_UPLOAD_DIR = Path("output") / "checkpoint_uploads" / "latest"
+WGS84_TRANSFORMER_CACHE: dict[str, pyproj.Transformer] = {}
 
 
 def _safe_upload_filename(filename: str | None, fallback: str) -> str:
@@ -53,6 +63,91 @@ def _store_uploaded_file(contents: str, filename: str | None, destination_dir: P
     path = destination_dir / _safe_upload_filename(filename, fallback)
     path.write_bytes(_decode_upload_contents(contents))
     return path
+
+
+def _read_route_history(csv_path: Path) -> list[dict[str, Any]]:
+    """Read a checkpoint trajectory CSV into dashboard route history rows."""
+
+    history: list[dict[str, Any]] = []
+    with csv_path.open("r", encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle):
+            history.append(
+                {
+                    "lat": float(row["lat"]),
+                    "lon": float(row["lon"]),
+                    "speed_mps": float(row["speed_mps"]),
+                    "azimuth_deg": float(row["azimuth_deg"]) % 360.0,
+                    "dominant_mode": "terrain_only_uploaded",
+                    "nav_mode": "terrain_only_uploaded",
+                    "gnss_available": False,
+                }
+            )
+    return history
+
+
+def _infer_nmea_frequency(path: Path) -> tuple[int, float | None]:
+    """Return valid GGA frame count and inferred frequency when timestamps allow it."""
+
+    reader = NMEAReader.from_file(path)
+    try:
+        frames = [frame for frame in reader if frame.valid and np.isfinite(frame.radar_alt_m)]
+    finally:
+        reader.close()
+    if not frames:
+        raise ValueError("NMEA не содержит валидных GPGGA/GNGGA кадров радиовысотомера")
+    timestamps = np.asarray([parse_nmea_timestamp_to_seconds(frame.timestamp_utc) for frame in frames], dtype=float)
+    timestamps = timestamps[np.isfinite(timestamps)]
+    if timestamps.size < 2:
+        return len(frames), None
+    deltas = np.diff(timestamps)
+    deltas = deltas[deltas > 1e-6]
+    if deltas.size == 0:
+        return len(frames), None
+    return len(frames), 1.0 / float(np.median(deltas))
+
+
+def _route_distance_m(history: list[dict[str, Any]]) -> float:
+    """Approximate WGS84 route length from dashboard history points."""
+
+    if len(history) < 2:
+        return 0.0
+    total_m = 0.0
+    for left, right in zip(history[:-1], history[1:]):
+        lat = float(left["lat"])
+        lon_scale = max(math.cos(math.radians(lat)), 1e-6)
+        dx = (float(right["lon"]) - float(left["lon"])) * 111_320.0 * lon_scale
+        dy = (float(right["lat"]) - float(left["lat"])) * 111_320.0
+        total_m += math.hypot(dx, dy)
+    return float(total_m)
+
+
+def _dem_preview_for_dashboard(dem_path: Path, max_dim: int = 180) -> tuple[np.ndarray, tuple[float, float, float, float, float, float]]:
+    """Build a small WGS84 DEM preview and affine tuple for the dashboard map."""
+
+    with rasterio.open(dem_path) as dataset:
+        scale = max(dataset.width / float(max_dim), dataset.height / float(max_dim), 1.0)
+        out_width = max(int(dataset.width / scale), 2)
+        out_height = max(int(dataset.height / scale), 2)
+        dem = dataset.read(out_shape=(1, out_height, out_width), resampling=Resampling.bilinear)[0].astype(float)
+        if dataset.nodata is not None:
+            dem[np.isclose(dem, float(dataset.nodata))] = np.nan
+
+        left, bottom, right, top = dataset.bounds
+        if dataset.crs is not None and dataset.crs.to_epsg() != 4326:
+            crs_key = str(dataset.crs)
+            transformer = WGS84_TRANSFORMER_CACHE.get(crs_key)
+            if transformer is None:
+                transformer = pyproj.Transformer.from_crs(dataset.crs, "EPSG:4326", always_xy=True)
+                WGS84_TRANSFORMER_CACHE[crs_key] = transformer
+            lon_left, lat_bottom = transformer.transform(left, bottom)
+            lon_right, lat_top = transformer.transform(right, top)
+        else:
+            lon_left, lat_bottom, lon_right, lat_top = float(left), float(bottom), float(right), float(top)
+
+    x_step = (float(lon_right) - float(lon_left)) / max(dem.shape[1], 1)
+    y_step = (float(lat_bottom) - float(lat_top)) / max(dem.shape[0], 1)
+    transform = (x_step, 0.0, float(lon_left), 0.0, y_step, float(lat_top))
+    return dem, transform
 
 
 def _meters_to_lat_deg(distance_m: float) -> float:
@@ -486,10 +581,10 @@ class TerrainNavigatorDash:
                                     style={"display": "flex", "gap": "8px", "alignItems": "center", "flexWrap": "wrap", "justifyContent": "flex-end"},
                                     children=[
                                         html.Div("GNSS: OFF/ON", style={**pill_style, "color": "#ff6679", "borderColor": "rgba(255, 85, 110, 0.48)"}),
-                                        html.Div("Режим: TERRAIN_NAV", style={**pill_style, "color": "#38d7ff"}),
-                                        html.Div("Сенсоры: OK", style={**pill_style, "color": "#7CFF8A", "borderColor": "rgba(73, 220, 110, 0.48)"}),
-                                        html.Div("Частота: 10 Гц", style={**pill_style, "color": "#63a7ff"}),
-                                        html.Div("Корреляция: LIVE", style={**pill_style, "color": "#c781ff", "borderColor": "rgba(181, 92, 255, 0.46)"}),
+                                        html.Div("Режим: ожидание", style={**pill_style, "color": "#38d7ff"}),
+                                        html.Div("Сенсоры: --", style={**pill_style, "color": "#7CFF8A", "borderColor": "rgba(73, 220, 110, 0.48)"}),
+                                        html.Div("Частота: --", style={**pill_style, "color": "#63a7ff"}),
+                                        html.Div("Корреляция: --", style={**pill_style, "color": "#c781ff", "borderColor": "rgba(181, 92, 255, 0.46)"}),
                                     ],
                                 ),
                             ],
@@ -556,37 +651,32 @@ class TerrainNavigatorDash:
                                                                     children=[
                                                                         dcc.Upload(
                                                                             id="checkpoint-heights-upload",
-                                                                            children=html.Div("Файл высот (txt)", style={"padding": "10px 12px", "textAlign": "center", "borderRadius": "10px", "border": "1px dashed rgba(119, 171, 208, 0.7)", "background": "rgba(10, 29, 47, 0.86)", "fontWeight": "700", "color": "#cfe7fa"}),
+                                                                            children=html.Div("Файл высот TXT", style={"padding": "10px 12px", "textAlign": "center", "borderRadius": "10px", "border": "1px dashed rgba(119, 171, 208, 0.7)", "background": "rgba(10, 29, 47, 0.86)", "fontWeight": "700", "color": "#cfe7fa"}),
+                                                                            accept=".txt,.csv",
                                                                             multiple=False,
                                                                         ),
                                                                         dcc.Upload(
                                                                             id="checkpoint-dem-upload",
-                                                                            children=html.Div("DEM GeoTIFF", style={"padding": "10px 12px", "textAlign": "center", "borderRadius": "10px", "border": "1px dashed rgba(119, 171, 208, 0.7)", "background": "rgba(10, 29, 47, 0.86)", "fontWeight": "700", "color": "#cfe7fa"}),
+                                                                            children=html.Div("Файл карты GeoTIFF", style={"padding": "10px 12px", "textAlign": "center", "borderRadius": "10px", "border": "1px dashed rgba(119, 171, 208, 0.7)", "background": "rgba(10, 29, 47, 0.86)", "fontWeight": "700", "color": "#cfe7fa"}),
+                                                                            accept=".tif,.tiff,.geotiff",
                                                                             multiple=False,
                                                                         ),
                                                                     ],
                                                                 ),
-                                                                html.Div(id="checkpoint-upload-filenames", style={"fontSize": "12px", "color": "#9fc4dc", "lineHeight": "1.45"}, children="Загрузите `heights.txt` и GeoTIFF, затем укажите start x/y, heading, speed, freq."),
+                                                                html.Div(id="checkpoint-upload-filenames", style={"fontSize": "12px", "color": "#9fc4dc", "lineHeight": "1.45"}, children="Выберите два файла: TXT с высотами и GeoTIFF карту. Затем укажите x/y, heading, speed, freq."),
                                                                 html.Div(
                                                                     style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "8px"},
                                                                     children=[
+                                                                        html.Div(style={"display": "none"}, children=[
+                                                                            dcc.Dropdown(id="checkpoint-input-format", options=[{"label": "TXT высоты", "value": "heights"}], value="heights"),
+                                                                            dcc.Dropdown(id="checkpoint-input-kind", options=[{"label": "радиовысотомер AGL", "value": "radar"}], value="radar"),
+                                                                            dcc.Dropdown(id="checkpoint-xy-mode", options=[{"label": "auto", "value": "auto"}], value="auto"),
+                                                                        ]),
                                                                         dcc.Input(id="checkpoint-start-x", type="number", placeholder="start x", debounce=True, style={"width": "100%", "padding": "10px 12px", "borderRadius": "10px", "border": "1px solid rgba(90, 145, 180, 0.55)", "background": "#071827", "color": "#f3fbff"}),
                                                                         dcc.Input(id="checkpoint-start-y", type="number", placeholder="start y", debounce=True, style={"width": "100%", "padding": "10px 12px", "borderRadius": "10px", "border": "1px solid rgba(90, 145, 180, 0.55)", "background": "#071827", "color": "#f3fbff"}),
-                                                                        dcc.Input(id="checkpoint-heading", type="number", placeholder="heading, deg", debounce=True, style={"width": "100%", "padding": "10px 12px", "borderRadius": "10px", "border": "1px solid rgba(90, 145, 180, 0.55)", "background": "#071827", "color": "#f3fbff"}),
+                                                                        dcc.Input(id="checkpoint-heading", type="number", value=0, debounce=True, placeholder="направление, ° от севера", style={"width": "100%", "padding": "10px 12px", "borderRadius": "10px", "border": "1px solid rgba(90, 145, 180, 0.55)", "background": "#071827", "color": "#f3fbff"}),
                                                                         dcc.Input(id="checkpoint-speed", type="number", value=50, debounce=True, placeholder="speed, m/s", style={"width": "100%", "padding": "10px 12px", "borderRadius": "10px", "border": "1px solid rgba(90, 145, 180, 0.55)", "background": "#071827", "color": "#f3fbff"}),
-                                                                        dcc.Input(id="checkpoint-freq", type="number", value=10, debounce=True, placeholder="freq, Hz", style={"width": "100%", "padding": "10px 12px", "borderRadius": "10px", "border": "1px solid rgba(90, 145, 180, 0.55)", "background": "#071827", "color": "#f3fbff"}),
-                                                                        dcc.Dropdown(
-                                                                            id="checkpoint-xy-mode",
-                                                                            options=[
-                                                                                {"label": "auto", "value": "auto"},
-                                                                                {"label": "pixel", "value": "pixel"},
-                                                                                {"label": "crs", "value": "crs"},
-                                                                                {"label": "local-m", "value": "local-m"},
-                                                                            ],
-                                                                            value="auto",
-                                                                            clearable=False,
-                                                                            style={"color": "#081420"},
-                                                                        ),
+                                                                        dcc.Input(id="checkpoint-freq", type="number", value=5, debounce=True, placeholder="freq, Hz", style={"width": "100%", "padding": "10px 12px", "borderRadius": "10px", "border": "1px solid rgba(90, 145, 180, 0.55)", "background": "#071827", "color": "#f3fbff"}),
                                                                     ],
                                                                 ),
                                                                 html.Div(
@@ -805,7 +895,7 @@ class TerrainNavigatorDash:
         def _checkpoint_file_labels(heights_filename: str | None, dem_filename: str | None) -> str:
             heights_label = heights_filename or "не выбран"
             dem_label = dem_filename or "не выбран"
-            return f"Файл высот: {heights_label}\nDEM: {dem_label}"
+            return f"Данные высот/NMEA: {heights_label}\nDEM: {dem_label}"
 
         @self.app.callback(
             Output("checkpoint-status", "children"),
@@ -821,6 +911,8 @@ class TerrainNavigatorDash:
             State("checkpoint-speed", "value"),
             State("checkpoint-freq", "value"),
             State("checkpoint-xy-mode", "value"),
+            State("checkpoint-input-format", "value"),
+            State("checkpoint-input-kind", "value"),
             prevent_initial_call=True,
         )
         def _checkpoint_load_callback(
@@ -835,22 +927,27 @@ class TerrainNavigatorDash:
             speed: float | None,
             freq: float | None,
             xy_mode: str | None,
+            input_format: str | None,
+            input_kind: str | None,
         ) -> tuple[str, dict[str, Any]]:
             del n_clicks
+            filename_suffix = Path(str(heights_filename or "")).suffix.lower()
+            input_format = "nmea" if filename_suffix in {".nmea", ".log"} else str(input_format or "heights")
+            input_kind = str(input_kind or "radar")
             missing: list[str] = []
             if not heights_contents:
-                missing.append("файл высот")
+                missing.append("TXT высот или NMEA")
             if not dem_contents:
                 missing.append("DEM GeoTIFF")
-            if start_x is None:
+            if input_format == "heights" and start_x is None:
                 missing.append("start x")
-            if start_y is None:
+            if input_format == "heights" and start_y is None:
                 missing.append("start y")
-            if heading is None:
-                missing.append("heading")
+            if input_format == "heights" and heading is None:
+                missing.append("направление")
             if speed is None:
                 missing.append("speed")
-            if freq is None:
+            if input_format == "heights" and freq is None:
                 missing.append("freq")
             if missing:
                 return f"Не хватает входов по кейсу: {', '.join(missing)}", no_update
@@ -858,32 +955,116 @@ class TerrainNavigatorDash:
             try:
                 upload_dir = CHECKPOINT_UPLOAD_DIR
                 upload_dir.mkdir(parents=True, exist_ok=True)
-                heights_path = _store_uploaded_file(heights_contents, heights_filename, upload_dir, "heights.txt")
+                input_fallback = "heights.txt" if input_format == "heights" else "case_input.nmea"
+                input_path = _store_uploaded_file(heights_contents, heights_filename, upload_dir, input_fallback)
                 dem_path = _store_uploaded_file(dem_contents, dem_filename, upload_dir, "dem.tif")
+                if input_format == "nmea":
+                    valid_frame_count, inferred_freq = _infer_nmea_frequency(input_path)
+                    effective_freq = float(inferred_freq if inferred_freq is not None else (freq if freq is not None else 5.0))
+                else:
+                    valid_frame_count = sum(1 for line in input_path.read_text(encoding="utf-8-sig").splitlines() if line.strip())
+                    effective_freq = float(freq)
+                if not (1.0 <= effective_freq <= 10.0):
+                    return f"Частота NMEA вне условий кейса: {effective_freq:.3f} Гц, нужно 1-10 Гц", no_update
                 manifest = {
-                    "heights": str(heights_path),
+                    "input": str(input_path),
+                    "input_format": input_format,
+                    "input_kind": input_kind,
                     "dem": str(dem_path),
-                    "start_x": float(start_x),
-                    "start_y": float(start_y),
-                    "heading": float(heading),
+                    "start_x": None if start_x is None else float(start_x),
+                    "start_y": None if start_y is None else float(start_y),
+                    "heading": 0.0 if heading is None else float(heading),
                     "speed": float(speed),
-                    "freq": float(freq),
+                    "freq": effective_freq,
+                    "valid_nmea_frames": int(valid_frame_count),
                     "xy_mode": str(xy_mode or "auto"),
                 }
                 (upload_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+                optional_start = ""
+                if start_x is not None and start_y is not None:
+                    optional_start = f' --start-x {float(start_x)} --start-y {float(start_y)} --xy-mode {str(xy_mode or "auto")}'
+                optional_heading = "" if heading is None else f" --heading {float(heading)}"
+                result_dir = upload_dir / "result"
+                run_args = [
+                    sys.executable,
+                    "checkpoint_runner.py",
+                    "--dem",
+                    str(dem_path),
+                    "--speed",
+                    str(float(speed)),
+                    "--window-size",
+                    "32",
+                    "--step-size",
+                    "16",
+                    "--max-offset",
+                    "0",
+                    "--freq",
+                    str(effective_freq),
+                    "--out-dir",
+                    str(result_dir),
+                    "--quiet-console",
+                ]
+                if input_format == "nmea":
+                    run_args.extend(["--nmea", str(input_path)])
+                else:
+                    run_args.extend(["--heights", str(input_path), "--input-kind", input_kind])
+                if start_x is not None and start_y is not None:
+                    run_args.extend(["--start-x", str(float(start_x)), "--start-y", str(float(start_y)), "--xy-mode", str(xy_mode or "auto")])
+                if heading is not None:
+                    run_args.extend(["--heading", str(float(heading))])
+                trajectory_csv = result_dir / "trajectory_estimated.csv"
+                trajectory_html = result_dir / "trajectory_visualization.html"
+                self._publish_empty_dashboard_state()
+
+                def _background_run_uploaded_case() -> None:
+                    try:
+                        completed = subprocess.run(
+                            run_args,
+                            cwd=Path.cwd(),
+                            capture_output=True,
+                            text=True,
+                            timeout=180,
+                            check=False,
+                        )
+                        if completed.returncode != 0:
+                            details = (completed.stderr or completed.stdout or "нет вывода").strip()
+                            LOGGER.error("Uploaded case route calculation failed: %s", details)
+                            return
+                        points = self._publish_uploaded_case_result(
+                            dem_path,
+                            trajectory_csv,
+                            replay_interval_s=0.35,
+                        )
+                        LOGGER.info("Uploaded case route published to dashboard: %d points", points)
+                    except Exception:
+                        LOGGER.exception("Uploaded case background route calculation failed")
+
+                threading.Thread(
+                    target=_background_run_uploaded_case,
+                    name="uploaded-case-runner",
+                    daemon=True,
+                ).start()
+
                 command = (
-                    f'python .\\checkpoint_runner.py --dem "{dem_path}" --heights "{heights_path}" --input-kind radar '
-                    f'--start-x {float(start_x)} --start-y {float(start_y)} --xy-mode {str(xy_mode or "auto")} '
-                    f'--heading {float(heading)} --speed {float(speed)} --freq {float(freq)} --dashboard --open-browser'
+                    f'python .\\checkpoint_runner.py --dem "{dem_path}" '
+                    f'{"--nmea" if input_format == "nmea" else "--heights"} "{input_path}" '
+                    f'--speed {float(speed)} --freq {effective_freq}{optional_start}{optional_heading} '
+                    f'{"" if input_format == "nmea" else f"--input-kind {input_kind} "}'
+                    "--window-size 32 --step-size 16 --max-offset 0 "
+                    "--dashboard --open-browser"
                 )
                 run_script = f'Set-Location "{Path.cwd()}"\r\n{command}\r\n'
                 (upload_dir / "run_checkpoint.ps1").write_text(run_script, encoding="utf-8")
                 status = (
-                    "Набор по кейсу сохранен.\n"
-                    f"heights: {heights_path.name}\n"
+                    "Набор по кейсу сохранен. Расчёт маршрута запущен.\n"
+                    f"input: {input_path.name} ({input_format})\n"
                     f"dem: {dem_path.name}\n"
-                    f"xy-mode: {str(xy_mode or 'auto')}\n"
-                    "Готовый запуск:\n"
+                    f"frames: {valid_frame_count}, freq: {effective_freq:.3f} Гц\n"
+                    f"start: {('центр DEM' if start_x is None or start_y is None else f'{float(start_x)}, {float(start_y)}')}\n"
+                    "Карта очищена; после расчёта маршрут начнёт проходить точка за точкой.\n"
+                    f"csv: {trajectory_csv}\n"
+                    f"html: {trajectory_html}\n"
+                    "Для live-dashboard можно запустить:\n"
                     f"{command}"
                 )
                 return status, manifest
@@ -936,13 +1117,11 @@ class TerrainNavigatorDash:
 
         if isinstance(state, dict) and bool(state.get("dashboard_idle")):
             self._latest_runtime_state = None
-            idle_store = {"history": []}
-            idle_message = str(state.get("idle_message", "Сначала загрузите данные по кейсу и запустите маршрут."))
-            waiting_figure = _build_status_figure("Ожидание запуска", idle_message)
-            return waiting_figure, waiting_figure, waiting_figure, waiting_figure, [], idle_store
+            empty = self._empty_screen_figure()
+            return empty, empty, empty, [], []
 
         if state is None:
-            empty = self._empty_screen_figure("Ожидание данных")
+            empty = self._empty_screen_figure()
             return empty, empty, empty, self._build_profile_stats_panel({}), self._build_signal_quality_panel({})
 
         return (
@@ -953,7 +1132,7 @@ class TerrainNavigatorDash:
             self._build_signal_quality_panel(state),
         )
 
-    def _empty_screen_figure(self, title: str) -> go.Figure:
+    def _empty_screen_figure(self, title: str = "") -> go.Figure:
         figure = go.Figure()
         figure.update_layout(
             template="plotly_dark",
@@ -1156,6 +1335,136 @@ class TerrainNavigatorDash:
                 pass
             self.control_queue.put_nowait(command)
 
+    def _publish_empty_dashboard_state(self) -> None:
+        """Clear current route/map state before a new uploaded-case run starts."""
+
+        self._latest_runtime_state = None
+        while True:
+            try:
+                self.state_queue.get_nowait()
+            except queue.Empty:
+                break
+        try:
+            self.state_queue.put_nowait({"dashboard_idle": True, "route_history": []})
+        except queue.Full:
+            pass
+
+    def _make_uploaded_case_state(
+        self,
+        *,
+        route_history: list[dict[str, Any]],
+        total_points: int,
+        dem_preview: np.ndarray,
+        dem_transform: tuple[float, float, float, float, float, float],
+    ) -> dict[str, Any]:
+        """Build one dashboard state for the currently visible uploaded route prefix."""
+
+        if not route_history:
+            raise ValueError("route_history пустой")
+        last = route_history[-1]
+        corr = CorrelationResult(
+            best_azimuth_deg=float(last["azimuth_deg"]),
+            best_offset_steps=0,
+            best_offset_m=0.0,
+            peak_correlation=0.0,
+            confidence=1.0,
+            is_reliable=True,
+            informative=True,
+            heatmap=np.zeros((360, 1), dtype=float),
+            azimuths_deg=np.arange(360.0, dtype=float),
+            best_reference_profile=np.empty((0,), dtype=float),
+        )
+        fix = IMMResult(
+            lat=float(last["lat"]),
+            lon=float(last["lon"]),
+            speed_mps=float(last["speed_mps"]),
+            azimuth_deg=float(last["azimuth_deg"]),
+            model_weights=np.array([0.0, 1.0, 0.0], dtype=float),
+            covariance=np.diag([25.0, 25.0, 4.0, 4.0]).astype(float),
+            dominant_mode="terrain_only_uploaded",
+        )
+        return {
+            "corr": corr,
+            "fix": fix,
+            "h_meas": np.empty((0,), dtype=float),
+            "ref": np.empty((0,), dtype=float),
+            "dem_patch": dem_preview,
+            "dem_patch_transform": tuple(float(value) for value in dem_transform),
+            "route_history": route_history,
+            "uploaded_visible_points": len(route_history),
+            "uploaded_total_points": int(total_points),
+            "uploaded_distance_m": _route_distance_m(route_history),
+            "hdop": 5.0,
+            "nav_mode": "terrain_only_uploaded",
+            "used_prediction_only": False,
+            "degraded": False,
+            "selected_window_size": 0,
+            "gnss_available": False,
+            "observability": {
+                "crlb_m": float("nan"),
+                "gradient_energy": 0.0,
+                "efficiency_hint": 0.0,
+                "is_informative": False,
+            },
+            "terrain_bias_m": 0.0,
+            "pipeline_latency_ms": 0.0,
+            "queue_latency_ms": 0.0,
+            "dashboard_latency_ms": 0.0,
+            "reaction_latency_ms": 0.0,
+            "measurement_step_m": 0.0,
+            "integrity_status": "OK",
+            "runtime_stats": {"state_payloads_enqueued": 1},
+        }
+
+    def _publish_dashboard_state(self, state: dict[str, Any]) -> None:
+        """Publish one state update, replacing stale dashboard frames."""
+
+        self._latest_runtime_state = state
+        try:
+            self.state_queue.put_nowait(state)
+        except queue.Full:
+            try:
+                self.state_queue.get_nowait()
+            except queue.Empty:
+                pass
+            self.state_queue.put_nowait(state)
+
+    def _publish_uploaded_case_result(
+        self,
+        dem_path: Path,
+        trajectory_csv: Path,
+        *,
+        replay_interval_s: float = 0.0,
+    ) -> int:
+        """Load a finished checkpoint run and push it to the dashboard."""
+
+        route_history = _read_route_history(trajectory_csv)
+        if not route_history:
+            raise ValueError("trajectory_estimated.csv пустой")
+        dem_preview, dem_transform = _dem_preview_for_dashboard(dem_path)
+        if replay_interval_s <= 0.0:
+            self._publish_dashboard_state(
+                self._make_uploaded_case_state(
+                    route_history=route_history,
+                    total_points=len(route_history),
+                    dem_preview=dem_preview,
+                    dem_transform=dem_transform,
+                )
+            )
+            return len(route_history)
+
+        for visible_count in range(1, len(route_history) + 1):
+            self._publish_dashboard_state(
+                self._make_uploaded_case_state(
+                    route_history=route_history[:visible_count],
+                    total_points=len(route_history),
+                    dem_preview=dem_preview,
+                    dem_transform=dem_transform,
+                )
+            )
+            time.sleep(float(replay_interval_s))
+        return len(route_history)
+
     def handle_control_button_click(self) -> str:
         """Handle dashboard control events by pushing commands to the pipeline."""
 
@@ -1210,12 +1519,14 @@ class TerrainNavigatorDash:
             state["gnss_available"] = bool(self._manual_gnss_enabled)
             self._latest_runtime_state = state
 
+        if isinstance(state, dict) and bool(state.get("dashboard_idle")):
+            self._latest_runtime_state = None
+            empty_figure = self._empty_screen_figure()
+            return empty_figure, empty_figure, empty_figure, empty_figure, [], {"history": []}
+
         if state is None:
-            waiting_figure = _build_status_figure(
-                "Ожидание данных",
-                "Pipeline еще не передал первое состояние. Подождите несколько секунд или перезапустите main.py.",
-            )
-            return waiting_figure, waiting_figure, waiting_figure, waiting_figure, [], store
+            empty_figure = self._empty_screen_figure()
+            return empty_figure, empty_figure, empty_figure, empty_figure, [], {"history": []}
 
         route_history = state.get("route_history")
         if isinstance(route_history, list) and route_history:
@@ -1825,6 +2136,30 @@ class TerrainNavigatorDash:
         correlation_status = "ОЖИДАНИЕ ОКНА" if not correlation_ready else ("ДА" if corr_is_reliable else "НЕТ")
         ambiguity_status = "НЕТ ДАННЫХ" if not correlation_ready else ("ДА" if corr_is_ambiguous else "НЕТ")
 
+        if nav_mode == "terrain_only_uploaded":
+            visible_points = int(state.get("uploaded_visible_points", 0) or 0)
+            total_points = max(int(state.get("uploaded_total_points", visible_points) or visible_points), 1)
+            progress_pct = min(max(visible_points / total_points * 100.0, 0.0), 100.0)
+            distance_m = float(state.get("uploaded_distance_m", 0.0) or 0.0)
+            elapsed_s = distance_m / max(speed_mps, 1e-6)
+            remaining_points = max(total_points - visible_points, 0)
+            status = "В движении" if visible_points < total_points else "Завершён"
+            metric_items = [
+                ("Статус прогона", status),
+                ("Прогресс", f"{progress_pct:.0f}%"),
+                ("Точки маршрута", f"{visible_points}/{total_points}"),
+                ("Пройдено", _format_metric_value(distance_m, "м")),
+                ("Время полёта", f"{elapsed_s:.1f} с"),
+                ("Осталось точек", str(remaining_points)),
+                ("Текущий курс", f"{best_azimuth_deg:.1f}°"),
+                ("Скорость", f"{speed_mps:.2f} м/с"),
+                ("Режим", "Рельеф без GNSS"),
+                ("GNSS", "ВЫКЛ"),
+                ("Целостность", integrity_status),
+                ("Задержка UI", _format_metric_value(dashboard_latency_ms, "мс")),
+            ]
+            return [self._metric_card(label, value) for label, value in metric_items]
+
         metric_items = [
             ("Источник позиции", fix_source),
             ("Режим навигации", nav_mode),
@@ -1884,6 +2219,9 @@ class TerrainNavigatorDash:
             "measurement_step_m": float(state.get("measurement_step_m", 30.0)),
             "integrity_status": str(state.get("integrity_status", "OK")),
             "runtime_stats": dict(state.get("runtime_stats", {})),
+            "uploaded_visible_points": int(state.get("uploaded_visible_points", 0) or 0),
+            "uploaded_total_points": int(state.get("uploaded_total_points", 0) or 0),
+            "uploaded_distance_m": float(state.get("uploaded_distance_m", 0.0) or 0.0),
             "truth": truth,
             "dem_patch_transform": state.get("dem_patch_transform"),
             "route_history": list(state.get("route_history", [])) if isinstance(state.get("route_history"), list) else [],

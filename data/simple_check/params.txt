@@ -1,0 +1,9 @@
+Параметры для формы dashboard:
+Файл высот: data/simple_check/simple_heights.txt
+GeoTIFF: data/simple_check/simple_dem.tif
+start x: 58.0
+start y: 86.0
+направление, градусы от севера: 55.0
+speed, m/s: 30.0
+freq, Hz: 5.0
+Высоты в файле: показания радиовысотомера AGL, метры, одна строка = один замер.
