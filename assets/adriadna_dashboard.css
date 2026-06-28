@@ -1,0 +1,100 @@
+.adriadna-shell {
+  position: relative;
+  isolation: isolate;
+}
+
+.adriadna-shell::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: -1;
+  background:
+    linear-gradient(rgba(255, 255, 255, 0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+  background-size: 42px 42px;
+  mask-image: radial-gradient(circle at 50% 18%, black 0%, transparent 72%);
+}
+
+.adriadna-shell * {
+  box-sizing: border-box;
+}
+
+.adriadna-shell button:hover {
+  transform: translateY(-1px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    0 18px 38px rgba(0, 0, 0, 0.38) !important;
+}
+
+.adriadna-shell button:active {
+  transform: translateY(0);
+}
+
+.section-switcher label {
+  cursor: pointer;
+  user-select: none;
+  transition:
+    color 140ms ease,
+    border-color 140ms ease,
+    box-shadow 140ms ease,
+    background 140ms ease,
+    transform 140ms ease;
+}
+
+.section-switcher label:hover {
+  border-color: rgba(98, 189, 255, 0.82) !important;
+  color: #f0fbff !important;
+  transform: translateY(-1px);
+}
+
+.section-switcher label:has(input:checked) {
+  color: #ffffff !important;
+  border-color: rgba(86, 196, 255, 0.92) !important;
+  background:
+    radial-gradient(circle at 18% 10%, rgba(101, 231, 255, 0.30), transparent 34%),
+    linear-gradient(180deg, rgba(13, 91, 165, 0.96), rgba(5, 27, 52, 0.98)) !important;
+  box-shadow:
+    0 0 26px rgba(42, 169, 255, 0.24),
+    inset 0 1px 0 rgba(255, 255, 255, 0.12) !important;
+}
+
+.adriadna-shell .dash-graph {
+  border-radius: 14px;
+}
+
+.adriadna-shell .js-plotly-plot .plotly .modebar {
+  right: 8px !important;
+  top: 8px !important;
+  background: rgba(3, 13, 23, 0.72) !important;
+  border: 1px solid rgba(86, 150, 196, 0.30);
+  border-radius: 12px;
+  padding: 3px;
+  backdrop-filter: blur(8px);
+}
+
+.adriadna-shell .js-plotly-plot .plotly .modebar-btn svg {
+  fill: rgba(222, 243, 255, 0.78) !important;
+}
+
+.adriadna-shell ::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+.adriadna-shell ::-webkit-scrollbar-track {
+  background: rgba(5, 18, 30, 0.88);
+  border-radius: 999px;
+}
+
+.adriadna-shell ::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, rgba(46, 169, 255, 0.76), rgba(31, 95, 148, 0.88));
+  border-radius: 999px;
+  border: 2px solid rgba(5, 18, 30, 0.88);
+}
+
+@media (max-width: 1180px) {
+  .adriadna-shell {
+    padding: 8px !important;
+  }
+}

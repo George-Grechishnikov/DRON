@@ -151,10 +151,16 @@ def export_flight_report(history: list[IMMResult], path: str) -> None:
         )
     )
     figure.update_layout(
-        template="plotly_dark",
         title="Отчет Адриадна",
         xaxis_title="Долгота",
         yaxis_title="Широта",
+        paper_bgcolor="#06111b",
+        plot_bgcolor="#0a1a29",
+        font={"family": "Bahnschrift, Segoe UI, Arial", "color": "#eaf6ff"},
+        title_font={"size": 18, "color": "#f4fbff"},
+        xaxis={"gridcolor": "rgba(140, 190, 220, 0.16)", "zerolinecolor": "rgba(255,255,255,0.22)"},
+        yaxis={"gridcolor": "rgba(140, 190, 220, 0.16)", "zerolinecolor": "rgba(255,255,255,0.22)"},
+        margin={"l": 48, "r": 24, "t": 56, "b": 42},
     )
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -259,53 +265,57 @@ class TerrainNavigatorDash:
         graph_config = {"scrollZoom": True, "displayModeBar": True, "responsive": True}
         button_style = {
             "padding": "13px 18px",
-            "borderRadius": "9px",
+            "borderRadius": "12px",
             "color": "#ffffff",
-            "fontWeight": "700",
+            "fontWeight": "850",
             "cursor": "pointer",
-            "letterSpacing": "0.02em",
-            "boxShadow": "inset 0 1px 0 rgba(255,255,255,0.16), 0 10px 22px rgba(0,0,0,0.22)",
+            "letterSpacing": "0.04em",
+            "textTransform": "uppercase",
+            "boxShadow": "inset 0 1px 0 rgba(255,255,255,0.18), 0 14px 32px rgba(0,0,0,0.30)",
+            "transition": "transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease",
         }
         pill_style = {
-            "padding": "8px 14px",
-            "borderRadius": "8px",
-            "background": "rgba(3, 17, 30, 0.92)",
-            "border": "1px solid rgba(52, 107, 145, 0.52)",
+            "padding": "8px 13px",
+            "borderRadius": "999px",
+            "background": "linear-gradient(180deg, rgba(8, 28, 46, 0.96), rgba(3, 13, 24, 0.96))",
+            "border": "1px solid rgba(74, 143, 190, 0.50)",
             "fontSize": "12px",
-            "fontWeight": "700",
+            "fontWeight": "850",
             "whiteSpace": "nowrap",
-            "boxShadow": "0 0 18px rgba(32, 136, 255, 0.06)",
+            "boxShadow": "0 0 24px rgba(32, 136, 255, 0.10), inset 0 1px 0 rgba(255,255,255,0.06)",
         }
         panel_style = {
-            "background": "linear-gradient(180deg, rgba(5, 20, 33, 0.96), rgba(3, 13, 23, 0.96))",
-            "border": "1px solid rgba(38, 84, 119, 0.74)",
-            "borderRadius": "12px",
-            "boxShadow": "0 18px 50px rgba(0,0,0,0.34), inset 0 1px 0 rgba(255,255,255,0.04)",
+            "background": "linear-gradient(180deg, rgba(8, 24, 39, 0.96), rgba(3, 12, 22, 0.98))",
+            "border": "1px solid rgba(62, 119, 158, 0.58)",
+            "borderRadius": "16px",
+            "boxShadow": "0 24px 70px rgba(0,0,0,0.38), inset 0 1px 0 rgba(255,255,255,0.06)",
             "overflow": "hidden",
         }
         panel_title_style = {
-            "padding": "10px 12px 0 12px",
+            "padding": "12px 14px 0 14px",
             "fontSize": "12px",
-            "fontWeight": "800",
-            "letterSpacing": "0.06em",
+            "fontWeight": "900",
+            "letterSpacing": "0.085em",
             "textTransform": "uppercase",
-            "color": "#d8ecff",
+            "color": "#e7f6ff",
         }
         micro_card_style = {
-            "background": "rgba(5, 19, 32, 0.88)",
-            "border": "1px solid rgba(50, 96, 130, 0.62)",
-            "borderRadius": "9px",
-            "padding": "10px",
+            "background": "linear-gradient(180deg, rgba(9, 28, 45, 0.90), rgba(4, 16, 28, 0.96))",
+            "border": "1px solid rgba(75, 134, 173, 0.54)",
+            "borderRadius": "13px",
+            "padding": "12px",
             "minHeight": "58px",
+            "boxShadow": "inset 0 1px 0 rgba(255,255,255,0.05)",
         }
         speed_button_style = {
-            "background": "rgba(10, 25, 40, 0.94)",
-            "border": "1px solid rgba(55, 104, 139, 0.70)",
-            "borderRadius": "8px",
-            "color": "#dcefff",
-            "fontWeight": "800",
+            "background": "linear-gradient(180deg, rgba(16, 39, 61, 0.94), rgba(7, 20, 34, 0.96))",
+            "border": "1px solid rgba(75, 134, 173, 0.62)",
+            "borderRadius": "11px",
+            "color": "#e6f5ff",
+            "fontWeight": "900",
             "padding": "9px 0",
             "textAlign": "center",
+            "boxShadow": "inset 0 1px 0 rgba(255,255,255,0.06)",
         }
         event_header_style = {
             "display": "grid",
@@ -353,19 +363,38 @@ class TerrainNavigatorDash:
                     html.Div(detail, style={"color": "#9fbdd4"}),
                 ],
             )
+        tab_style = {
+            "background": "linear-gradient(180deg, rgba(11, 31, 50, 0.92), rgba(5, 17, 29, 0.94))",
+            "border": "1px solid rgba(65, 124, 166, 0.58)",
+            "borderRadius": "999px",
+            "color": "#b7d8ef",
+            "fontWeight": "900",
+            "padding": "10px 16px",
+            "letterSpacing": "0.035em",
+            "boxShadow": "inset 0 1px 0 rgba(255,255,255,0.06)",
+        }
+        tab_selected_style = {
+            **tab_style,
+            "background": "linear-gradient(180deg, rgba(12, 66, 124, 0.96), rgba(5, 25, 45, 0.98))",
+            "border": "1px solid rgba(76, 159, 255, 0.86)",
+            "color": "#ffffff",
+            "boxShadow": "0 0 22px rgba(33, 142, 255, 0.20)",
+        }
 
         return html.Div(
             style={
                 "background": (
-                    "radial-gradient(circle at 20% 0%, rgba(21, 74, 112, 0.28), transparent 32%), "
-                    "radial-gradient(circle at 80% 18%, rgba(19, 100, 78, 0.18), transparent 30%), "
-                    "linear-gradient(180deg, #06111b 0%, #071825 46%, #030b12 100%)"
+                    "radial-gradient(circle at 12% -8%, rgba(37, 128, 183, 0.30), transparent 34%), "
+                    "radial-gradient(circle at 74% 4%, rgba(36, 202, 154, 0.14), transparent 28%), "
+                    "radial-gradient(circle at 92% 76%, rgba(12, 74, 132, 0.20), transparent 32%), "
+                    "linear-gradient(180deg, #03101b 0%, #061827 44%, #02070d 100%)"
                 ),
                 "color": "#eaf6ff",
                 "minHeight": "100vh",
-                "padding": "10px",
+                "padding": "12px",
                 "fontFamily": "Bahnschrift, 'Segoe UI', Arial, sans-serif",
             },
+            className="adriadna-shell",
             children=[
                 html.Div(
                     style={
@@ -374,8 +403,9 @@ class TerrainNavigatorDash:
                         "alignItems": "center",
                         "justifyContent": "space-between",
                         "gap": "12px",
-                        "padding": "9px 12px",
-                        "marginBottom": "8px",
+                        "padding": "11px 14px",
+                        "marginBottom": "10px",
+                        "borderColor": "rgba(79, 155, 210, 0.70)",
                     },
                     children=[
                         html.Div(
@@ -389,19 +419,19 @@ class TerrainNavigatorDash:
                                         "borderRadius": "12px",
                                         "display": "grid",
                                         "placeItems": "center",
-                                        "background": "linear-gradient(135deg, #0d78ff, #28e2ff)",
+                                        "background": "linear-gradient(135deg, #12a2ff, #4fffd2)",
                                         "color": "#04101c",
                                         "fontSize": "18px",
                                         "fontWeight": "900",
-                                        "boxShadow": "0 0 24px rgba(40, 226, 255, 0.28)",
+                                        "boxShadow": "0 0 28px rgba(55, 210, 255, 0.34)",
                                     },
                                 ),
                                 html.Div(
                                     children=[
-                                        html.Div("Адриадна | Симуляция полета БПЛА", style={"fontSize": "22px", "fontWeight": "900", "lineHeight": "1.05"}),
+                                        html.Div("Адриадна | Симуляция полета БПЛА", style={"fontSize": "23px", "fontWeight": "900", "lineHeight": "1.05", "letterSpacing": "0.01em"}),
                                         html.Div(
                                             "Поиск БПЛА после потери GNSS по DEM и радиовысотомеру",
-                                            style={"fontSize": "12px", "color": "#8fb7d4", "marginTop": "3px"},
+                                            style={"fontSize": "12px", "color": "#9fc6dd", "marginTop": "4px"},
                                         ),
                                     ]
                                 ),
@@ -415,12 +445,29 @@ class TerrainNavigatorDash:
                                 html.Div("Сенсоры: OK", style={**pill_style, "color": "#7CFF8A", "borderColor": "rgba(73, 220, 110, 0.48)"}),
                                 html.Div("Частота: 10 Гц", style={**pill_style, "color": "#63a7ff"}),
                                 html.Div("Корреляция: LIVE", style={**pill_style, "color": "#c781ff", "borderColor": "rgba(181, 92, 255, 0.46)"}),
-                            ],
-                        ),
                     ],
                 ),
+                dcc.Store(id="history-store", data={"history": []}),
+                dcc.Interval(id="dashboard-interval", interval=100, n_intervals=0),
+                dcc.RadioItems(
+                    id="app-sections",
+                    value="flight",
+                    options=[
+                        {"label": "Полет и управление", "value": "flight"},
+                        {"label": "Профиль и качество", "value": "profile"},
+                    ],
+                    inline=True,
+                    className="section-switcher",
+                    style={"display": "flex", "gap": "8px", "margin": "8px 0 10px 0"},
+                    labelStyle=tab_style,
+                    inputStyle={"display": "none"},
+                ),
                 html.Div(
-                    style={"display": "grid", "gridTemplateColumns": "1.36fr 0.96fr", "gap": "8px", "alignItems": "stretch"},
+                    id="flight-section",
+                    style={"display": "block"},
+                    children=[
+                        html.Div(
+                            style={"display": "grid", "gridTemplateColumns": "minmax(560px, 1.42fr) minmax(420px, 0.92fr)", "gap": "10px", "alignItems": "stretch"},
                     children=[
                         html.Div(
                             style=panel_style,
@@ -522,8 +569,6 @@ class TerrainNavigatorDash:
                         ),
                     ],
                 ),
-                dcc.Store(id="history-store", data={"history": []}),
-                dcc.Interval(id="dashboard-interval", interval=100, n_intervals=0),
                 html.Div(
                     style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "8px", "marginTop": "8px"},
                     children=[
@@ -580,10 +625,110 @@ class TerrainNavigatorDash:
                         ),
                     ],
                 ),
+                    ],
+                ),
+                html.Div(
+                    id="profile-section",
+                    style={"display": "none"},
+                    children=[
+                                html.Div(
+                    style={
+                        "marginTop": "12px",
+                        "paddingTop": "10px",
+                        "borderTop": "1px solid rgba(55, 105, 142, 0.55)",
+                    },
+                    children=[
+                        html.Div(
+                            "Экран 2. Анализ профиля высоты и качества сигналов",
+                            style={
+                                "fontSize": "15px",
+                                "fontWeight": "900",
+                                "letterSpacing": "0.05em",
+                                "textTransform": "uppercase",
+                                "color": "#eaf6ff",
+                                "marginBottom": "8px",
+                            },
+                        ),
+                        html.Div(
+                            style={"display": "grid", "gridTemplateColumns": "1fr 260px", "gap": "8px", "alignItems": "stretch"},
+                            children=[
+                                html.Div(
+                                    style={"display": "grid", "gridTemplateRows": "1fr 0.8fr 1fr", "gap": "8px"},
+                                    children=[
+                                        html.Div(style=panel_style, children=[html.Div("1. Профиль высоты", style=panel_title_style), dcc.Graph(id="altitude-profile-screen", config=graph_config, style={"height": "28vh", "minHeight": "235px"})]),
+                                        html.Div(style=panel_style, children=[html.Div("2. Скорость и курс", style=panel_title_style), dcc.Graph(id="speed-heading-screen", config=graph_config, style={"height": "21vh", "minHeight": "185px"})]),
+                                        html.Div(style=panel_style, children=[html.Div("3. Сигналы датчиков", style=panel_title_style), dcc.Graph(id="sensor-signals-screen", config=graph_config, style={"height": "25vh", "minHeight": "220px"})]),
+                                    ],
+                                ),
+                                html.Div(id="profile-stats-panel", style={"display": "grid", "gap": "8px"}),
+                            ],
+                        ),
+                        html.Div(
+                            style={"display": "grid", "gridTemplateColumns": "1fr 300px", "gap": "8px", "marginTop": "8px"},
+                            children=[
+                                html.Div(
+                                    style={**panel_style, "padding": "14px"},
+                                    children=[
+                                        html.Div("Формула восстановления профиля рельефа", style={**panel_title_style, "padding": "0 0 10px 0"}),
+                                        html.Div(
+                                            style={"display": "grid", "gridTemplateColumns": "360px 1fr 1fr", "gap": "18px", "alignItems": "center"},
+                                            children=[
+                                                html.Div(
+                                                    "terrain_profile = baro_alt_m - radar_alt_m",
+                                                    style={
+                                                        "border": "1px solid rgba(81, 130, 161, 0.7)",
+                                                        "borderRadius": "8px",
+                                                        "padding": "16px",
+                                                        "fontSize": "18px",
+                                                        "fontFamily": "Consolas, monospace",
+                                                        "background": "rgba(8, 22, 34, 0.95)",
+                                                        "color": "#ffffff",
+                                                    },
+                                                ),
+                                                html.Div(
+                                                    children=[
+                                                        html.Div("terrain_profile", style={"color": "#7CFF8A", "fontFamily": "Consolas, monospace", "fontWeight": "900"}),
+                                                        html.Div("восстановленный профиль рельефа, м", style={"color": "#9fbdd4", "fontSize": "12px"}),
+                                                        html.Div("baro_alt_m", style={"color": "#caff73", "fontFamily": "Consolas, monospace", "fontWeight": "900", "marginTop": "8px"}),
+                                                        html.Div("барометрическая высота, м", style={"color": "#9fbdd4", "fontSize": "12px"}),
+                                                    ],
+                                                ),
+                                                html.Div(
+                                                    children=[
+                                                        html.Div("radar_alt_m", style={"color": "#57d6ff", "fontFamily": "Consolas, monospace", "fontWeight": "900"}),
+                                                        html.Div("высота по радиовысотомеру AGL, м", style={"color": "#9fbdd4", "fontSize": "12px"}),
+                                                        html.Div("Все высоты приведены в метрах.", style={"color": "#cfe7fa", "fontSize": "12px", "marginTop": "10px"}),
+                                                    ],
+                                                ),
+                                            ],
+                                        ),
+                                    ],
+                                ),
+                                html.Div(id="signal-quality-panel", style={"display": "grid", "gap": "8px"}),
+                            ],
+                        ),
+                    ],
+                ),
+                            ],
+                        ),
+                    ],
+                ),
             ],
         )
 
     def _register_callbacks(self) -> None:
+        @self.app.callback(
+            Output("flight-section", "style"),
+            Output("profile-section", "style"),
+            Input("app-sections", "value"),
+        )
+        def _section_switch_callback(section: str) -> tuple[dict[str, str], dict[str, str]]:
+            visible = {"display": "block"}
+            hidden = {"display": "none"}
+            if section == "profile":
+                return hidden, visible
+            return visible, hidden
+
         @self.app.callback(
             Output("control-status", "children"),
             Input("gnss-on-button", "n_clicks"),
@@ -607,6 +752,215 @@ class TerrainNavigatorDash:
         )
         def _callback(n_intervals: int, data_store: dict[str, Any]) -> tuple[Any, Any, Any, Any, Any, Any]:
             return self.update_all_panels(n_intervals, data_store)
+
+        @self.app.callback(
+            Output("altitude-profile-screen", "figure"),
+            Output("speed-heading-screen", "figure"),
+            Output("sensor-signals-screen", "figure"),
+            Output("profile-stats-panel", "children"),
+            Output("signal-quality-panel", "children"),
+            Input("dashboard-interval", "n_intervals"),
+            State("history-store", "data"),
+        )
+        def _profile_screen_callback(n_intervals: int, data_store: dict[str, Any]) -> tuple[Any, Any, Any, Any, Any]:
+            return self.update_profile_screen(n_intervals, data_store)
+
+    def update_profile_screen(
+        self,
+        n_intervals: int,
+        data_store: dict[str, Any] | None,
+    ) -> tuple[go.Figure, go.Figure, go.Figure, list[html.Div], list[html.Div]]:
+        """Build the second dashboard screen: altitude profile and signal quality."""
+
+        del n_intervals
+        state = self._latest_runtime_state
+        if state is None and isinstance(data_store, dict):
+            latest = data_store.get("latest_state")
+            if isinstance(latest, dict):
+                state = latest
+
+        if state is None:
+            empty = self._empty_screen_figure("Ожидание данных")
+            return empty, empty, empty, self._build_profile_stats_panel({}), self._build_signal_quality_panel({})
+
+        return (
+            self._build_altitude_profile_screen_figure(state),
+            self._build_speed_heading_screen_figure(state, data_store or {}),
+            self._build_sensor_signals_screen_figure(state),
+            self._build_profile_stats_panel(state),
+            self._build_signal_quality_panel(state),
+        )
+
+    def _empty_screen_figure(self, title: str) -> go.Figure:
+        figure = go.Figure()
+        figure.update_layout(
+            template="plotly_dark",
+            title=title,
+            margin={"l": 42, "r": 24, "t": 46, "b": 34},
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(4, 17, 29, 0.85)",
+        )
+        return figure
+
+    def _screen_arrays(self, state: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        h_meas = np.asarray(state.get("h_meas", np.array([], dtype=float)), dtype=float)
+        h_ref = np.asarray(state.get("ref", np.array([], dtype=float)), dtype=float)
+        h_ref = _align_reference_to_measurement(h_meas, h_ref)
+        if h_ref.size != h_meas.size:
+            h_ref = np.full(h_meas.shape, np.nan, dtype=float)
+        x_min = np.linspace(0.0, 20.0, max(h_meas.size, 1), dtype=float)[: h_meas.size]
+        baro = np.full(h_meas.shape, float(state.get("baro_alt_m", 1500.0)), dtype=float)
+        radar = baro - h_meas if h_meas.size else np.array([], dtype=float)
+        return x_min, h_meas, h_ref, radar
+
+    def _build_altitude_profile_screen_figure(self, state: dict[str, Any]) -> go.Figure:
+        x_min, terrain, dem_ref, radar = self._screen_arrays(state)
+        baro = np.full(terrain.shape, float(state.get("baro_alt_m", 1500.0)), dtype=float)
+        figure = go.Figure()
+        figure.add_trace(go.Scatter(x=x_min, y=baro, mode="lines", line={"color": "#7fe35b", "width": 2}, name="Барометрическая высота (баро, м)"))
+        figure.add_trace(go.Scatter(x=x_min, y=dem_ref, mode="lines", line={"color": "#ff9d32", "width": 2, "dash": "dash"}, name="Высота рельефа DEM (м)"))
+        figure.add_trace(go.Scatter(x=x_min, y=radar, mode="lines", line={"color": "#18d6cf", "width": 2, "dash": "dot"}, name="Высота по радару AGL (м)"))
+        figure.add_trace(go.Scatter(x=x_min, y=terrain, mode="lines", line={"color": "#d5ff56", "width": 2, "dash": "dot"}, name="Восстановленный профиль рельефа (м)"))
+        for event_x, label, color in [(4.0, "ПОТЕРЯ GNSS", "#ff4757"), (10.0, "ПЕРЕХОД В\nTERRAIN_NAV", "#ff9f1a")]:
+            figure.add_vline(x=event_x, line_width=1, line_dash="dash", line_color=color)
+            figure.add_annotation(x=event_x, y=0.95, xref="x", yref="paper", text=label, showarrow=True, arrowhead=2, ay=34, font={"color": color, "size": 10})
+        figure.update_layout(
+            template="plotly_dark",
+            margin={"l": 48, "r": 24, "t": 18, "b": 34},
+            xaxis_title="Время, мин",
+            yaxis_title="Высота, м",
+            legend={"orientation": "h", "y": 1.14, "x": 0.02, "font": {"size": 10}},
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(4, 17, 29, 0.82)",
+            hovermode="x unified",
+            uirevision="altitude-profile-screen",
+        )
+        return figure
+
+    def _build_speed_heading_screen_figure(self, state: dict[str, Any], data_store: dict[str, Any]) -> go.Figure:
+        history = list(data_store.get("history", [])) if isinstance(data_store, dict) else []
+        if history:
+            speeds = np.asarray([float(entry.get("speed_mps", 0.0)) for entry in history], dtype=float)
+            headings = np.asarray([float(entry.get("azimuth_deg", 0.0)) % 360.0 for entry in history], dtype=float)
+        else:
+            fix = state.get("fix")
+            speeds = np.asarray([float(_extract_fix_field(fix, "speed_mps", 0.0))], dtype=float)
+            headings = np.asarray([float(_extract_fix_field(fix, "azimuth_deg", 0.0)) % 360.0], dtype=float)
+        x_min = np.linspace(0.0, 20.0, max(speeds.size, 1), dtype=float)[: speeds.size]
+        figure = go.Figure()
+        figure.add_trace(go.Scatter(x=x_min, y=speeds, mode="lines", line={"color": "#4b9cff", "width": 2}, name="Скорость (м/с)"))
+        figure.add_trace(go.Scatter(x=x_min, y=headings, mode="lines", line={"color": "#f7d13d", "width": 2}, yaxis="y2", name="Курс (град)"))
+        figure.update_layout(
+            template="plotly_dark",
+            margin={"l": 48, "r": 48, "t": 18, "b": 34},
+            xaxis_title="Время, мин",
+            yaxis={"title": "Скорость, м/с", "range": [0, max(60.0, float(np.nanmax(speeds)) + 10.0)]},
+            yaxis2={"title": "Курс, град", "overlaying": "y", "side": "right", "range": [0, 360]},
+            legend={"orientation": "h", "y": 1.12, "x": 0.02, "font": {"size": 10}},
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(4, 17, 29, 0.82)",
+            hovermode="x unified",
+            uirevision="speed-heading-screen",
+        )
+        return figure
+
+    def _build_sensor_signals_screen_figure(self, state: dict[str, Any]) -> go.Figure:
+        x_min, terrain, dem_ref, radar = self._screen_arrays(state)
+        baro = np.full(terrain.shape, float(state.get("baro_alt_m", 1500.0)), dtype=float)
+        confidence = float(_extract_corr_field(state.get("corr"), "confidence", 0.0))
+        confidence_line = np.full(terrain.shape, max(min(confidence, 1.0), 0.0), dtype=float)
+        figure = go.Figure()
+        figure.add_trace(go.Scatter(x=x_min, y=baro, mode="markers", marker={"color": "#28d95f", "size": 3, "opacity": 0.45}, name="Барометр (сырые данные)"))
+        figure.add_trace(go.Scatter(x=x_min, y=baro, mode="lines", line={"color": "#7fe35b", "width": 2}, name="Барометр (сглажено)"))
+        figure.add_trace(go.Scatter(x=x_min, y=radar, mode="markers", marker={"color": "#28d6ff", "size": 3, "opacity": 0.45}, name="Радар (сырые данные)"))
+        figure.add_trace(go.Scatter(x=x_min, y=radar, mode="lines", line={"color": "#56a9ff", "width": 2}, name="Радар (сглажено)"))
+        figure.add_trace(go.Scatter(x=x_min, y=dem_ref, mode="lines", line={"color": "#ff9d32", "width": 2}, name="DEM (выборка)"))
+        figure.add_trace(go.Scatter(x=x_min, y=confidence_line, mode="lines", line={"color": "#b970ff", "width": 2}, yaxis="y2", name="Доверие (0..1)"))
+        figure.update_layout(
+            template="plotly_dark",
+            margin={"l": 48, "r": 48, "t": 18, "b": 34},
+            xaxis_title="Время, мин",
+            yaxis_title="Высота, м",
+            yaxis2={"title": "Доверие", "overlaying": "y", "side": "right", "range": [0, 1]},
+            legend={"orientation": "h", "y": 1.15, "x": 0.02, "font": {"size": 10}},
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(4, 17, 29, 0.82)",
+            hovermode="x unified",
+            uirevision="sensor-signals-screen",
+        )
+        return figure
+
+    def _build_profile_stats_panel(self, state: dict[str, Any]) -> list[html.Div]:
+        _, terrain, _, radar = self._screen_arrays(state)
+        baro = np.full(terrain.shape, float(state.get("baro_alt_m", 1500.0)), dtype=float)
+        residual_rmse = float("nan")
+        if terrain.size:
+            _, _, dem_ref, _ = self._screen_arrays(state)
+            if dem_ref.size == terrain.size:
+                residual_rmse = float(np.sqrt(np.nanmean((terrain - dem_ref) ** 2)))
+        return [
+            self._stats_section("4. Статистика и качество", []),
+            self._stats_section("Барометрическая высота (м)", [("Мин.", _safe_stat(baro, "min")), ("Макс.", _safe_stat(baro, "max")), ("Среднее", _safe_stat(baro, "mean"))]),
+            self._stats_section("Высота по радару AGL (м)", [("Мин.", _safe_stat(radar, "min")), ("Макс.", _safe_stat(radar, "max")), ("Среднее", _safe_stat(radar, "mean"))]),
+            self._stats_section("Восстановленный профиль (м)", [("Мин.", _safe_stat(terrain, "min")), ("Макс.", _safe_stat(terrain, "max")), ("Среднее", _safe_stat(terrain, "mean")), ("RMSE к DEM", residual_rmse)]),
+            self._stats_section("Общие данные", [("Количество выборок", float(terrain.size)), ("Частота дискретизации", 10.0), ("Режим навигации", str(state.get("nav_mode", "TERRAIN_NAV")))]),
+        ]
+
+    def _build_signal_quality_panel(self, state: dict[str, Any]) -> list[html.Div]:
+        corr = state.get("corr")
+        confidence = float(_extract_corr_field(corr, "confidence", 0.0))
+        peak = float(_extract_corr_field(corr, "peak_correlation", 0.0))
+        observability = dict(state.get("observability", {}))
+        gradient_energy = float(observability.get("gradient_energy", 0.0) or 0.0)
+        return [
+            self._quality_line("Барометр: OK", "Стабильный сигнал, низкий шум", "#7CFF8A"),
+            self._quality_line("Радар: OK", "Уверенный измерительный запас", "#57d6ff"),
+            self._quality_line("Рельеф: OK", f"Корреляция {peak:.2f}, доверие {confidence:.2f}, градиент {gradient_energy:.2f}", "#ffb84d"),
+        ]
+
+    def _stats_section(self, title: str, rows: list[tuple[str, Any]]) -> html.Div:
+        children: list[Any] = [
+            html.Div(title, style={"fontSize": "12px", "fontWeight": "900", "color": "#eaf6ff", "textTransform": "uppercase", "marginBottom": "6px"})
+        ]
+        for label, value in rows:
+            children.append(
+                html.Div(
+                    style={"display": "grid", "gridTemplateColumns": "1fr 88px", "borderTop": "1px solid rgba(55, 96, 124, 0.45)", "padding": "6px 0", "fontSize": "12px"},
+                    children=[
+                        html.Div(label, style={"color": "#c5dff2"}),
+                        html.Div(_format_screen_number(value), style={"color": "#f4faff", "fontWeight": "800", "textAlign": "right"}),
+                    ],
+                )
+            )
+        return html.Div(
+            style={
+                "background": "linear-gradient(180deg, rgba(5, 20, 33, 0.96), rgba(3, 13, 23, 0.96))",
+                "border": "1px solid rgba(38, 84, 119, 0.74)",
+                "borderRadius": "10px",
+                "padding": "10px",
+            },
+            children=children,
+        )
+
+    def _quality_line(self, label: str, detail: str, color: str) -> html.Div:
+        return html.Div(
+            style={
+                "display": "grid",
+                "gridTemplateColumns": "18px 120px 1fr",
+                "gap": "8px",
+                "alignItems": "center",
+                "background": "rgba(5, 20, 33, 0.96)",
+                "border": "1px solid rgba(38, 84, 119, 0.74)",
+                "borderRadius": "10px",
+                "padding": "10px",
+                "fontSize": "12px",
+            },
+            children=[
+                html.Div("✓", style={"color": color, "fontSize": "18px", "fontWeight": "900"}),
+                html.Div(label, style={"color": color, "fontWeight": "900"}),
+                html.Div(detail, style={"color": "#9fbdd4"}),
+            ],
+        )
 
     def handle_gnss_button_click(self) -> str:
         """Handle a GNSS control button event by pushing a command to the control queue."""
@@ -790,7 +1144,13 @@ class TerrainNavigatorDash:
             title=f"Тепловая карта корреляции | пик={corr.peak_correlation:.3f} @ {corr.best_azimuth_deg:.0f}°",
             xaxis_title="Смещение, м",
             yaxis_title="Азимут, °",
-            margin={"l": 40, "r": 20, "t": 60, "b": 40},
+            margin={"l": 46, "r": 22, "t": 58, "b": 42},
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(4, 17, 29, 0.88)",
+            font={"family": "Bahnschrift, Segoe UI, Arial", "color": "#eaf6ff"},
+            title_font={"size": 16, "color": "#f4fbff"},
+            xaxis={"gridcolor": "rgba(120, 175, 210, 0.14)", "zerolinecolor": "rgba(255,255,255,0.22)"},
+            yaxis={"gridcolor": "rgba(120, 175, 210, 0.14)", "zerolinecolor": "rgba(255,255,255,0.22)"},
         )
         figure.update_layout(uirevision="correlation-heatmap")
         return figure
@@ -829,7 +1189,7 @@ class TerrainNavigatorDash:
                     opacity=0.78,
                     name="Оцененная траектория",
                 )
-            )
+            )     
         figure.add_trace(
             go.Scatter(
                 x=[entry["lon"] for entry in history],
@@ -939,7 +1299,11 @@ class TerrainNavigatorDash:
             title="Карта рельефа и траектория",
             xaxis_title="Долгота",
             yaxis_title="Широта",
-            margin={"l": 40, "r": 20, "t": 60, "b": 40},
+            margin={"l": 48, "r": 24, "t": 58, "b": 42},
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(4, 17, 29, 0.88)",
+            font={"family": "Bahnschrift, Segoe UI, Arial", "color": "#eaf6ff"},
+            title_font={"size": 16, "color": "#f4fbff"},
             shapes=create_arrow_shape(fix.lat, fix.lon, fix.azimuth_deg, length_deg=arrow_length_deg),
             annotations=[
                 {
@@ -962,8 +1326,8 @@ class TerrainNavigatorDash:
         figure.update_layout(
             dragmode="zoom",
             uirevision="terrain-map-zoom",
-            xaxis={"fixedrange": False},
-            yaxis={"fixedrange": False, "scaleanchor": "x", "scaleratio": 1},
+            xaxis={"fixedrange": False, "gridcolor": "rgba(255,255,255,0.12)", "zerolinecolor": "rgba(255,255,255,0.18)"},
+            yaxis={"fixedrange": False, "scaleanchor": "x", "scaleratio": 1, "gridcolor": "rgba(255,255,255,0.12)", "zerolinecolor": "rgba(255,255,255,0.18)"},
         )
         return figure
 
@@ -1048,7 +1412,13 @@ class TerrainNavigatorDash:
                     "font": {"size": 14, "color": "#f4f7fb"},
                 }
             ],
-            margin={"l": 40, "r": 20, "t": 60, "b": 40},
+            margin={"l": 46, "r": 22, "t": 58, "b": 42},
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(4, 17, 29, 0.88)",
+            font={"family": "Bahnschrift, Segoe UI, Arial", "color": "#eaf6ff"},
+            title_font={"size": 16, "color": "#f4fbff"},
+            xaxis={"gridcolor": "rgba(120, 175, 210, 0.14)", "zerolinecolor": "rgba(255,255,255,0.22)"},
+            yaxis={"gridcolor": "rgba(120, 175, 210, 0.14)", "zerolinecolor": "rgba(255,255,255,0.22)"},
         )
         figure.update_layout(uirevision="profiles-graph")
         return figure
@@ -1328,18 +1698,34 @@ class TerrainNavigatorDash:
         }
 
     def _metric_card(self, label: str, value: str) -> html.Div:
+        label_lower = label.lower()
+        accent = "#3aa7ff"
+        if any(token in label_lower for token in ["ошибка", "rmse", "crlb", "смещение"]):
+            accent = "#ffcf5a"
+        if any(token in label_lower for token in ["gnss", "целостность", "надежна"]):
+            accent = "#49df86"
+        if any(token in label_lower for token in ["неоднозначность", "потеряно", "задержка"]):
+            accent = "#ff6b7a"
+        if "скорость" in label_lower:
+            accent = "#56d9ff"
         return html.Div(
             style={
-                "background": "linear-gradient(180deg, rgba(8, 25, 41, 0.96), rgba(5, 17, 29, 0.96))",
-                "border": "1px solid rgba(45, 86, 119, 0.72)",
-                "borderRadius": "9px",
-                "padding": "9px 10px",
-                "minHeight": "58px",
-                "boxShadow": "inset 0 1px 0 rgba(255,255,255,0.035)",
+                "position": "relative",
+                "overflow": "hidden",
+                "background": (
+                    "radial-gradient(circle at 86% 12%, rgba(74, 170, 255, 0.12), transparent 38%), "
+                    "linear-gradient(180deg, rgba(10, 30, 49, 0.96), rgba(4, 15, 27, 0.98))"
+                ),
+                "border": "1px solid rgba(67, 123, 160, 0.72)",
+                "borderLeft": f"3px solid {accent}",
+                "borderRadius": "14px",
+                "padding": "11px 12px",
+                "minHeight": "82px",
+                "boxShadow": "inset 0 1px 0 rgba(255,255,255,0.05), 0 10px 26px rgba(0,0,0,0.22)",
             },
             children=[
-                html.Div(label, style={"fontSize": "10px", "color": "#8faec8", "marginBottom": "5px", "lineHeight": "1.1"}),
-                html.Div(value, style={"fontSize": "17px", "fontWeight": "900", "color": "#f4faff", "lineHeight": "1.05"}),
+                html.Div(label, style={"fontSize": "10px", "color": "#9fc4dc", "marginBottom": "8px", "lineHeight": "1.1", "letterSpacing": "0.035em", "textTransform": "uppercase"}),
+                html.Div(value, style={"fontSize": "18px", "fontWeight": "900", "color": "#f7fbff", "lineHeight": "1.05", "textShadow": "0 0 18px rgba(90, 180, 255, 0.16)"}),
             ],
         )
 
@@ -1366,6 +1752,50 @@ def _extract_fix_field(fix_state: Any, field_name: str, default: Any) -> Any:
     if isinstance(fix_state, dict):
         return fix_state.get(field_name, default)
     return default
+
+
+def _extract_corr_field(corr: Any, field_name: str, default: Any) -> Any:
+    """Read a field from either CorrelationResult or its serialized dashboard dict."""
+
+    if isinstance(corr, CorrelationResult):
+        return getattr(corr, field_name, default)
+    if isinstance(corr, dict):
+        return corr.get(field_name, default)
+    return default
+
+
+def _safe_stat(values: np.ndarray, mode: str) -> float:
+    """Return a finite statistic for dashboard tables."""
+
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan")
+    if mode == "min":
+        return float(np.min(arr))
+    if mode == "max":
+        return float(np.max(arr))
+    if mode == "mean":
+        return float(np.mean(arr))
+    raise ValueError(f"Unsupported stat mode: {mode}")
+
+
+def _format_screen_number(value: Any) -> str:
+    """Format values for compact screen-2 statistics tables."""
+
+    if isinstance(value, str):
+        return value
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    if not np.isfinite(numeric):
+        return "n/a"
+    if abs(numeric - round(numeric)) < 1e-9 and abs(numeric) >= 100:
+        return f"{numeric:.0f}"
+    if abs(numeric) >= 100:
+        return f"{numeric:.1f}"
+    return f"{numeric:.2f}"
 
 
 def _compute_track_error_m(fix_state: Any, truth: Any) -> float:

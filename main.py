@@ -37,6 +37,17 @@ from visualizer import TerrainNavigatorDash, export_flight_report
 LOGGER = logging.getLogger(__name__)
 
 
+def _safe_export_flight_report(history: list[IMMResult], path: str) -> None:
+    """Export the HTML report without letting a rendering issue kill the run."""
+
+    if not history:
+        return
+    try:
+        export_flight_report(history, path)
+    except Exception:
+        LOGGER.exception("Flight report export failed for %s", path)
+
+
 @dataclass(frozen=True)
 class Config:
     """Runtime configuration for the full TERRAIN NAVIGATOR pipeline."""
@@ -2962,7 +2973,7 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
             stop_event.set()
             signal.signal(signal.SIGINT, previous_handler)
         if pipeline_history:
-            export_flight_report([item for _, item in pipeline_history], str(Path("output") / "terrain_navigator_report.html"))
+            _safe_export_flight_report([item for _, item in pipeline_history], str(Path("output") / "terrain_navigator_report.html"))
         return pipeline_history, pipeline_metrics
 
     pipeline_history: list[tuple[int, IMMResult]] = []
@@ -3062,7 +3073,7 @@ def run_pipeline(config: Config) -> tuple[list[tuple[int, IMMResult]], ReplayMet
 
     dashboard_history = [item for _, item in pipeline_history]
     if dashboard_history:
-        export_flight_report(dashboard_history, str(Path("output") / "terrain_navigator_report.html"))
+        _safe_export_flight_report(dashboard_history, str(Path("output") / "terrain_navigator_report.html"))
     return pipeline_history, pipeline_metrics
 
 
